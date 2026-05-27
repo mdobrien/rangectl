@@ -74,17 +74,21 @@ Core problem: GNS3 has the right mental model but terrible execution (race condi
 - `LibvirtBackend`: create, start, stop, destroy VMs
 - XML generation for VM definitions
 - COW overlay disk management (qcow2 overlays backed by read-only base)
-- SQLite DB setup — schema for topologies, nodes, bridges, IP allocations, state
+- SQLite DB setup — schema for topologies, nodes, bridges, IP allocations, state, images
 - Resource validation (check host capacity before deploy)
+- **Unit tests**: MockBackend, StateDB schema ops, resource validation math
+- **Integration tests**: VM create/start/stop/destroy via libvirt
 
 ### Phase 2: Networking
 - Linux bridge create/destroy
 - Tap interfaces, wire to bridges
-- Management bridge per topology (`testbed-mgmt-{name}`)
+- Management bridge per topology (`rangectl-mgmt-{name}`)
 - Host interface on mgmt bridge at .254
 - Sequential /24 mgmt subnet allocation from pool
 - Static IP assignment via cloud-init/netplan
 - Topology-name-prefixed resource naming
+- **Unit tests**: IP allocation, subnet math, bridge naming
+- **Integration tests**: bridge create, tap wiring, ping connectivity
 
 ### Phase 3: State Machine + Dependency Resolver
 - Node state machine with defined transitions (defined → provisioning → ready → linked → running → destroying)
@@ -94,15 +98,19 @@ Core problem: GNS3 has the right mental model but terrible execution (race condi
 - Deferred link wiring (both endpoints ready before bridge/tap creation)
 - Structured logging — state transitions, probes, commands — stored in SQLite
 - Deploy progress streaming (real-time)
+- **Unit tests**: state transitions, topo-sort, wave computation
+- **Integration tests**: full deploy with readiness probes
 
 ### Phase 4: Image Registry + Builder
-- Local image store (directory + metadata)
+- Local image store (directory + metadata in SQLite)
 - `image add` / `image list` / `image remove` with inject method declaration
 - `ImageBuilder`: boot, apply, snapshot, store (pre-bakes SSH key + guest agent)
 - COW base images are read-only, overlays per node
+- **Unit tests**: image metadata CRUD in SQLite
+- **Integration tests**: boot-and-snapshot image build
 
 ### Phase 5: Dependency & Config Injection
-- `apt()`, `pip()`, `choco()`, `powershell()` on Node and DependencySet
+- `packages()`, `powershell()` on Node and DependencySet
 - `install()` for custom software
 - `@configure` decorator for custom Python
 - `service()` declarations with readiness
@@ -111,6 +119,8 @@ Core problem: GNS3 has the right mental model but terrible execution (race condi
 - SSH keypair generation per topology, key injection via config method
 - Paramiko for exec/upload over mgmt network
 - Fail-fast with `cleanup_on_fail=True` default, debug mode to leave nodes up
+- **Unit tests**: ordering, apply(), configure registration
+- **Integration tests**: SSH exec, package install, file upload
 
 ### Phase 6: SDK API Surface
 - `Topology`, `Node`, `Link` classes
@@ -119,14 +129,18 @@ Core problem: GNS3 has the right mental model but terrible execution (race condi
 - `topo.export()` / `Topology.from_yaml()`
 - `list_topologies()`
 - Imperative interaction: `exec`, `upload`, `snapshot`, `restore`
-- `lab.logs()`, `lab["node"].logs()` for structured log access
+- `rng.logs()`, `rng["node"].logs()` for structured log access
 - Cross-node references via node objects (`target.eth0.ip`)
+- **Unit tests**: Topology/Node/Link API, export/import
+- **Integration tests**: end-to-end topology lifecycle
 
 ### Phase 7: Windows Support
 - UEFI boot, virtio drivers
 - cloudbase-init / unattend.xml generation
-- `choco()`, `powershell()` on Node/DependencySet
+- `powershell()` on Node/DependencySet
 - WinRM for post-boot config
+- **Unit tests**: Windows-specific dep resolution
+- **Integration tests**: Windows VM boot, cloudbase-init, WinRM
 
 ## Open Questions
 - YAML export schema — define later

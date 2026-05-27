@@ -135,7 +135,13 @@ Topology.from_yaml("topology.yaml")
 No CLI. Python SDK is the only interface. Clean enough that a README + examples gets someone to a working topology in 20 minutes.
 
 ### R13: Deployable on Any Ubuntu Box
-Install story: `apt install qemu-kvm libvirt-daemon-system && pip install testbed`. No special OS, no Proxmox, no web UI.
+Install story: `apt install qemu-kvm libvirt-daemon-system && pip install rangectl`. No special OS, no Proxmox, no web UI.
+
+### R14: Gated TDD Workflow
+Every code change follows: write unit tests → write code → pass unit tests → write integration tests → pass integration tests. Unit tests gate commits, integration tests gate merges. All tests serve as regression tests for future changes.
+
+### R15: Separated Test Layers
+Unit tests (`tests/unit/`) run anywhere, use MockBackend and in-memory SQLite. Integration tests (`tests/integration/`) require a KVM host, test real VMs/bridges/SSH. No mixing — clear boundary between what needs infra and what doesn't.
 
 ## Design Decisions
 
@@ -230,3 +236,11 @@ Install story: `apt install qemu-kvm libvirt-daemon-system && pip install testbe
 ### D21: DNS — Deferred (Nice to Have)
 **Decision**: No per-topology dnsmasq for now. Cross-node references use the node object directly (e.g. `target.eth0.ip` in `@configure` scripts) rather than hostname resolution.
 **Reason**: dnsmasq adds a process per topology to manage and clean up. The engine already has the IP map — expose it through the SDK objects instead. Revisit if users need in-guest hostname resolution.
+
+### D22: Gated TDD with Separated Test Layers
+**Decision**: `tests/unit/` (MockBackend, in-memory SQLite, no infra) and `tests/integration/` (real libvirt, KVM host required). Unit tests gate commits, integration tests gate merges.
+**Reason**: Agents need fast feedback loops to catch regressions. Unit tests run in seconds anywhere. Integration tests take minutes and need KVM — separating them means agents always run unit tests but only run integration tests on the EC2 box. All tests accumulate as regression tests.
+
+### D23: MockBackend for Unit Testing
+**Decision**: A `MockBackend` that implements the `Backend` protocol, records all calls, and returns canned responses. Paired with in-memory SQLite (`StateDB(db_path=":memory:")`).
+**Reason**: The `Backend` protocol makes this clean — the entire engine (wave ordering, readiness flow, dependency injection) can be tested without libvirt. Fast, deterministic, runs anywhere.
