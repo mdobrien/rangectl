@@ -1,6 +1,6 @@
 # Phase 0: EC2 Environment Bootstrap
 **Created**: 2026-05-27
-**Status**: In Progress
+**Status**: Complete
 **Phase**: 0
 
 ## Related Issues
@@ -44,15 +44,54 @@ Store in `~/.rangectl/images/`:
 - Smoke test VM booted, SSH'd, destroyed cleanly
 
 ## Success Criteria
-- [ ] `ec2-bootstrap.sh` exists in `scratch/scripts/`
-- [ ] Script runs successfully on EC2 instance
-- [ ] KVM enabled, libvirt running
-- [ ] All 3 base images downloaded to `~/.rangectl/images/`
-- [ ] Smoke test: VM boots, SSH works, VM destroyed
-- [ ] Script is idempotent (safe to re-run)
-- [ ] Committed to git
+- [x] `ec2-bootstrap.sh` exists in `scratch/scripts/`
+- [x] Script runs successfully on EC2 instance (c5.metal @ 44.192.21.7)
+- [x] KVM enabled, libvirt running
+- [x] All 3 base images present at `/var/lib/libvirt/images/` (symlinked from `~/.rangectl/images`)
+- [x] Smoke test: VM boots, SSH works, VM destroyed
+- [x] Script is idempotent (safe to re-run; second run skipped downloads, re-passed smoke)
+- [x] Committed to git
 
 ## Gate Output
-(paste validation output here when complete)
+```
+==> Installing apt packages...
+==> Checking KVM availability...
+==>   KVM OK
+==> Adding ubuntu to libvirt and kvm groups...
+==> Creating /home/ubuntu/.rangectl...
+==> Migrating existing /home/ubuntu/.rangectl/images -> /var/lib/libvirt/images
+==> Setting up Python venv at /home/ubuntu/.rangectl/venv...
+==> Image exists: jammy-server-cloudimg-amd64.img
+==> Image exists: noble-server-cloudimg-amd64.img
+==> Image exists: vyos-rolling-amd64.iso
+==> Smoke test: generating SSH key...
+==> Smoke test: building cloud-init seed ISO...
+==> Smoke test: creating COW overlay...
+==> Smoke test: booting VM with virt-install...
+==> Smoke test: waiting for VM IP...
+==> Smoke test: VM IP=192.168.122.107
+==> Smoke test: waiting for SSH...
+==> Smoke test: running hostname over SSH...
+==> Smoke test: remote hostname=rangectl-smoke
+==> Validating environment...
+==>   kvm-ok: OK
+==>   virsh: OK
+==>   images: OK
+==>   smoke test: OK
+================================================================
+rangectl EC2 bootstrap complete
+================================================================
+```
 
 ## Resolution
+The initial failure was an AppArmor block: `~/.rangectl/images/*.img` could not be
+opened by qemu. Adding a local override at `/etc/apparmor.d/local/usr.lib.libvirt.qemu`
+did not help — that file is not included by the relevant abstraction. The real
+gate is `virt-aa-helper`, whose own profile only permits stat'ing files under
+`/var/lib/libvirt/images/`, `/var/lib/nova/images/`, and `/var/lib/uvtool/libvirt/images/`.
+Disks outside those paths cannot be auto-whitelisted in the per-VM profile.
+
+Fix: store images in `/var/lib/libvirt/images/` (root:libvirt 2775) and surface
+them under `~/.rangectl/images` via a symlink. Smoke artifacts (overlay + seed ISO)
+are mktemp'd under the same dir for the same reason. Files chowned `user:libvirt`
+with 0664/0660 so dynamic ownership flips cleanly.

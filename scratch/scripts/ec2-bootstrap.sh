@@ -12,7 +12,12 @@ TARGET_USER="${SUDO_USER:-ubuntu}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 RANGECTL_DIR="$TARGET_HOME/.rangectl"
 VENV_DIR="$RANGECTL_DIR/venv"
-IMAGES_DIR="$RANGECTL_DIR/images"
+# Store images under libvirt's stock path so AppArmor's libvirt-qemu profile
+# (which whitelists /var/lib/libvirt/images/** rwk) lets qemu open them. We
+# symlink ~/.rangectl/images -> /var/lib/libvirt/images so the SDK can still
+# reference the user-friendly path.
+IMAGES_DIR="/var/lib/libvirt/images"
+IMAGES_LINK="$RANGECTL_DIR/images"
 
 log() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -63,7 +68,20 @@ usermod -aG kvm "$TARGET_USER"
 # 3. Directories
 #-----------------------------------------------------------------------------
 log "Creating $RANGECTL_DIR..."
-install -d -o "$TARGET_USER" -g "$TARGET_USER" "$RANGECTL_DIR" "$IMAGES_DIR"
+install -d -o "$TARGET_USER" -g "$TARGET_USER" "$RANGECTL_DIR"
+# Images live in libvirt's stock dir (group-writable by libvirt) and are
+# surfaced under ~/.rangectl/images via a symlink for SDK ergonomics.
+install -d -o root -g libvirt -m 2775 "$IMAGES_DIR"
+if [ -e "$IMAGES_LINK" ] && [ ! -L "$IMAGES_LINK" ]; then
+    # First-run migration: a real dir from a prior bootstrap. Move contents
+    # into the libvirt path so we don't lose downloads, then replace with link.
+    log "Migrating existing $IMAGES_LINK -> $IMAGES_DIR"
+    find "$IMAGES_LINK" -mindepth 1 -maxdepth 1 -exec mv -t "$IMAGES_DIR" {} +
+    rmdir "$IMAGES_LINK"
+fi
+ln -sfn "$IMAGES_DIR" "$IMAGES_LINK"
+chown -h "$TARGET_USER:$TARGET_USER" "$IMAGES_LINK"
+usermod -aG libvirt "$TARGET_USER"  # ensure user can write to images dir
 
 #-----------------------------------------------------------------------------
 # 4. Python venv + deps (as target user)
@@ -90,7 +108,10 @@ download_if_missing() {
     log "Downloading $(basename "$dest")..."
     curl -fL --retry 3 -o "$dest.tmp" "$url"
     mv "$dest.tmp" "$dest"
-    chown "$TARGET_USER:$TARGET_USER" "$dest"
+    # Owned by user but group-libvirt so dynamic ownership flips and reads
+    # work cleanly under the stock AppArmor profile.
+    chown "$TARGET_USER:libvirt" "$dest"
+    chmod 664 "$dest"
 }
 
 UBUNTU_22="$IMAGES_DIR/jammy-server-cloudimg-amd64.img"
@@ -123,7 +144,9 @@ fi
 # 6. Smoke test: boot Ubuntu 22.04, SSH in, run hostname, destroy
 #-----------------------------------------------------------------------------
 SMOKE_NAME="rangectl-smoke-test"
-SMOKE_DIR="$(mktemp -d)"
+# Keep smoke artifacts under libvirt's images dir so AppArmor allows qemu to
+# open the overlay and seed ISO without a custom profile rule.
+SMOKE_DIR="$(mktemp -d -p "$IMAGES_DIR" smoke.XXXXXX)"
 SMOKE_OVERLAY="$SMOKE_DIR/overlay.qcow2"
 SMOKE_SEED="$SMOKE_DIR/seed.iso"
 SMOKE_KEY="$SMOKE_DIR/id_ed25519"
@@ -168,9 +191,10 @@ cloud-localds "$SMOKE_SEED" "$SMOKE_DIR/user-data" "$SMOKE_DIR/meta-data"
 log "Smoke test: creating COW overlay..."
 qemu-img create -f qcow2 -F qcow2 -b "$UBUNTU_22" "$SMOKE_OVERLAY" 10G >/dev/null
 
-# libvirt's default qemu user needs to read the smoke dir
+# libvirt-qemu needs read on the disk files; group-libvirt + 0640 is enough.
 chmod 755 "$SMOKE_DIR"
-chmod 644 "$SMOKE_OVERLAY" "$SMOKE_SEED"
+chown root:libvirt "$SMOKE_OVERLAY" "$SMOKE_SEED"
+chmod 660 "$SMOKE_OVERLAY" "$SMOKE_SEED"
 
 log "Smoke test: booting VM with virt-install..."
 virsh net-start default 2>/dev/null || true
