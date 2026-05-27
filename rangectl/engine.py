@@ -5,7 +5,7 @@ from threading import Thread
 from rangectl.backend import Backend
 from rangectl.state import StateDB
 from rangectl.topology import Range, LiveNode, Node, Topology
-from rangectl.types import NodeState
+from rangectl.types import CycleError, NodeState, ResourceError
 
 log = logging.getLogger(__name__)
 
@@ -25,14 +25,35 @@ class Engine:
         resources = self._backend.host_resources()
         log.info("Available: %d vCPU, %d MB memory",
                  resources.available_vcpu, resources.available_memory_mb)
-        # raise if insufficient
-        raise NotImplementedError
+        if total_vcpu > resources.available_vcpu:
+            raise ResourceError(
+                f"insufficient vcpu: need {total_vcpu}, available {resources.available_vcpu}"
+            )
+        if total_memory > resources.available_memory_mb:
+            raise ResourceError(
+                f"insufficient memory: need {total_memory} MB, "
+                f"available {resources.available_memory_mb} MB"
+            )
 
     def compute_waves(self, topology: Topology) -> list[list[Node]]:
         log.info("Computing deploy waves for topology '%s'", topology.name)
-        # topo-sort nodes by depends_on, group into waves
-        # wave N+1 only contains nodes whose deps are all in waves <= N
-        raise NotImplementedError
+        nodes = list(topology._nodes.values())
+        node_names = {n.name for n in nodes}
+        remaining_deps: dict[str, set[str]] = {
+            n.name: {d.name for d in n.depends_on if d.name in node_names}
+            for n in nodes
+        }
+        waves: list[list[Node]] = []
+        placed: set[str] = set()
+        while len(placed) < len(nodes):
+            wave = [n for n in nodes
+                    if n.name not in placed and remaining_deps[n.name] <= placed]
+            if not wave:
+                unresolved = [n.name for n in nodes if n.name not in placed]
+                raise CycleError(f"dependency cycle among nodes: {unresolved}")
+            waves.append(wave)
+            placed.update(n.name for n in wave)
+        return waves
 
     def deploy(self, topology: Topology, cleanup_on_fail: bool = True) -> Range:
         log.info("Engine deploying topology '%s'", topology.name)

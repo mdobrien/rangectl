@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Protocol
 
 from rangectl.types import ExecResult, VMSpec
@@ -33,6 +34,7 @@ class Backend(Protocol):
     def host_resources(self) -> HostResources: ...
 
 
+@dataclass
 class HostResources:
     total_vcpu: int
     total_memory_mb: int

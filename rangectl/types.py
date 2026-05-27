@@ -4,6 +4,14 @@ from enum import Enum
 from typing import Callable
 
 
+class ResourceError(Exception):
+    pass
+
+
+class CycleError(Exception):
+    pass
+
+
 class NodeState(Enum):
     DEFINED = "defined"
     PROVISIONING = "provisioning"
