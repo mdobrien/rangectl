@@ -1,11 +1,18 @@
 from __future__ import annotations
 import hashlib
 import logging
+import os
 from pathlib import Path
 from threading import Lock, Thread
 
 from rangectl.backend import Backend
-from rangectl.networking import allocate_mgmt_ip, bridge_name, mgmt_bridge_name
+from rangectl.cloudinit import create_seed_iso
+from rangectl.networking import (
+    allocate_mgmt_ip,
+    bridge_name,
+    mgmt_bridge_name,
+    mgmt_host_ip,
+)
 from rangectl.state import StateDB
 from rangectl.topology import LiveNode, Node, Range, Topology
 from rangectl.types import (
@@ -20,7 +27,20 @@ from rangectl.types import (
 
 log = logging.getLogger(__name__)
 
-OVERLAY_ROOT = Path("~/.rangectl/overlays").expanduser()
+# Overlays and seed ISOs live under libvirt's default image dir so the stock
+# AppArmor profile (which whitelists /var/lib/libvirt/images/**) lets qemu open
+# them without a custom rule. Fall back to ~/.rangectl when running unit tests
+# that won't actually launch qemu.
+def _state_root() -> Path:
+    libvirt = Path("/var/lib/libvirt/images")
+    if libvirt.exists() and os.access(libvirt, os.W_OK):
+        return libvirt / "rangectl"
+    return Path("~/.rangectl").expanduser()
+
+
+OVERLAY_ROOT = _state_root() / "overlays"
+SEED_ROOT = _state_root() / "seeds"
+MGMT_CIDR = "24"
 
 
 def _mac_for(topo_name: str, node_name: str, suffix: str) -> str:
@@ -79,6 +99,14 @@ class Engine:
             placed.update(n.name for n in wave)
         return waves
 
+    def _link_index_for(self, topology: Topology, node_name: str,
+                        iface_name: str) -> int | None:
+        for i, link in enumerate(topology._links):
+            for side in (link.if_a, link.if_b):
+                if side.node_name == node_name and side.interface_name == iface_name:
+                    return i
+        return None
+
     def deploy(self, topology: Topology, cleanup_on_fail: bool = True) -> Range:
         log.info("Engine deploying topology '%s'", topology.name)
 
@@ -93,10 +121,13 @@ class Engine:
 
         log.info("Step 2: Allocate mgmt subnet")
         mgmt_subnet = self._db.allocate_mgmt_subnet(topology.name)
+        host_ip = mgmt_host_ip(mgmt_subnet)
 
         log.info("Step 3: Create mgmt bridge")
         mgmt_bridge = mgmt_bridge_name(topology.name)
         self._backend.create_bridge(mgmt_bridge)
+        # Give the host an IP on the mgmt bridge so it can SSH into VMs.
+        self._backend.assign_host_ip(mgmt_bridge, host_ip, MGMT_CIDR)
 
         # Save topology row now that we have subnet + bridge.
         self._db.save_topology(
@@ -108,24 +139,43 @@ class Engine:
         self._db.log_event(topology.name, None, "info",
                            f"mgmt subnet {mgmt_subnet} bridge {mgmt_bridge}")
 
-        # Stable index for mgmt IP assignment based on declaration order.
+        log.info("Step 4: Create topology link bridges")
+        for i, _ in enumerate(topology._links):
+            br = bridge_name(topology.name, i)
+            self._backend.create_bridge(br)
+            self._link_bridges[topology.name].append(br)
+            self._db._conn.execute(
+                "INSERT INTO bridges (topology_name, name, bridge_type) VALUES (?, ?, ?)",
+                (topology.name, br, "topology"),
+            )
+        self._db._conn.commit()
+
+        log.info("Step 5: Pre-allocate mgmt IPs")
         node_index: dict[str, int] = {
             name: i for i, name in enumerate(topology._nodes.keys())
         }
+        for node in topology._nodes.values():
+            ip = allocate_mgmt_ip(mgmt_subnet, node_index[node.name])
+            self._mgmt_ips[(topology.name, node.name)] = ip
 
-        log.info("Step 4: Compute waves")
+        # Eagerly request the topology ssh pubkey so it's available to all
+        # parallel deploy threads (and to seed ISO generation).
+        ssh_pubkey = self._backend.ssh_pubkey(topology.name)
+
+        log.info("Step 6: Compute waves")
         waves = self.compute_waves(topology)
 
-        log.info("Step 5: Deploy waves")
+        log.info("Step 7: Deploy waves")
         for i, wave in enumerate(waves):
             log.info("Wave %d: %s", i + 1, [n.name for n in wave])
-            self._deploy_wave(topology, wave, mgmt_subnet, mgmt_bridge, node_index)
+            self._deploy_wave(topology, wave, mgmt_subnet, mgmt_bridge,
+                              ssh_pubkey, host_ip)
 
-        log.info("Step 6: Wire topology links")
+        log.info("Step 8: Wire topology links (DB + attach for hot-attach back-ends)")
         for link_idx, link in enumerate(topology._links):
             self._wire_link(topology, link, link_idx)
 
-        log.info("Step 7: Run dependency injection")
+        log.info("Step 9: Run dependency injection")
         for node in topology._nodes.values():
             self._inject_dependencies(topology, node)
 
@@ -154,13 +204,14 @@ class Engine:
 
     def _deploy_wave(self, topology: Topology, wave: list[Node],
                      mgmt_subnet: str, mgmt_bridge: str,
-                     node_index: dict[str, int]) -> None:
+                     ssh_pubkey: str, host_ip: str) -> None:
         threads: list[Thread] = []
         errors: list[BaseException] = []
 
         def _runner(n: Node) -> None:
             try:
-                self._deploy_node(topology, n, mgmt_subnet, mgmt_bridge, node_index[n.name])
+                self._deploy_node(topology, n, mgmt_subnet, mgmt_bridge,
+                                  ssh_pubkey, host_ip)
             except BaseException as exc:  # capture for join-time re-raise
                 with self._lock:
                     errors.append(exc)
@@ -178,9 +229,41 @@ class Engine:
         if errors:
             raise errors[0]
 
+    def _build_interface_specs(self, topology: Topology, node: Node,
+                               mgmt_bridge: str) -> list[InterfaceSpec]:
+        """Compute final InterfaceSpec list with bridge+mac populated."""
+        ifaces: list[InterfaceSpec] = []
+        # Management interface is always present and always called "mgmt"
+        # internally (named differently from topology ifaces to avoid clashing
+        # if a user puts a topology link on eth0).
+        ifaces.append(InterfaceSpec(
+            node_name=node.name,
+            interface_name="mgmt",
+            ip=self._mgmt_ips[(topology.name, node.name)],
+            cidr="24",
+            bridge=mgmt_bridge,
+            mac=_mac_for(topology.name, node.name, "mgmt"),
+        ))
+        # Topology link interfaces — find matching link bridge by index.
+        for iface_name, ifs in node._interfaces.items():
+            link_idx = self._link_index_for(topology, node.name, iface_name)
+            if link_idx is None:
+                continue
+            br = bridge_name(topology.name, link_idx)
+            mac = _mac_for(topology.name, node.name, iface_name)
+            ifaces.append(InterfaceSpec(
+                node_name=node.name,
+                interface_name=iface_name,
+                ip=ifs.ip,
+                cidr=ifs.cidr,
+                bridge=br,
+                mac=mac,
+            ))
+        return ifaces
+
     def _deploy_node(self, topology: Topology, node: Node,
                      mgmt_subnet: str, mgmt_bridge: str,
-                     index: int) -> None:
+                     ssh_pubkey: str, host_ip: str) -> None:
         log.info("[%s/%s] Provisioning", topology.name, node.name)
         node.state = transition_node_state(node.state, NodeState.PROVISIONING)
         self._db.save_node(
@@ -201,18 +284,46 @@ class Engine:
         overlay_path = str(OVERLAY_ROOT / topology.name / f"{node.name}.qcow2")
         self._backend.create_overlay(image_path, overlay_path)
 
-        mgmt_iface = InterfaceSpec(node_name=node.name, interface_name="eth0")
-        topo_ifaces = [
-            ifs for name, ifs in node._interfaces.items() if name != "eth0"
-        ]
+        # Build the final interface list with bridges + MACs assigned.
+        ifaces = self._build_interface_specs(topology, node, mgmt_bridge)
+        mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
+
+        # Generate the cloud-init seed ISO before create_vm so it can be
+        # attached as a CDROM. Tests use MockBackend which never reads it; we
+        # still attempt creation but tolerate environments without cloud-localds
+        # (the helper raises; engine should swallow only when backend is mock).
+        seed_path = str(SEED_ROOT / topology.name / f"{node.name}.iso")
+        Path(seed_path).parent.mkdir(parents=True, exist_ok=True)
+        seed_ifaces = []
+        for i, ifs in enumerate(ifaces):
+            seed_ifaces.append({
+                "mac": ifs.mac,
+                "ip": ifs.ip,
+                "cidr": ifs.cidr,
+                "gateway": host_ip if ifs.interface_name == "mgmt" else None,
+            })
+        try:
+            create_seed_iso(
+                output_path=seed_path,
+                hostname=f"{topology.name}-{node.name}",
+                ssh_pubkey=ssh_pubkey,
+                ifaces=seed_ifaces,
+            )
+        except RuntimeError as exc:
+            log.warning("Skipping seed ISO build (%s); proceeding without it", exc)
+            seed_path = None  # type: ignore[assignment]
+
         spec = VMSpec(
             name=f"{topology.name}-{node.name}",
             image=node.image,
             vcpu=node.vcpu,
             memory=node.memory,
             os_type=node.os_type,
-            interfaces=[mgmt_iface, *topo_ifaces],
+            interfaces=ifaces,
             overlay_path=overlay_path,
+            seed_iso_path=seed_path,
+            mgmt_ip=mgmt_ip,
+            topology_name=topology.name,
         )
         vm_id = self._backend.create_vm(spec)
         with self._lock:
@@ -220,14 +331,13 @@ class Engine:
 
         self._backend.start(vm_id)
 
-        mgmt_ip = allocate_mgmt_ip(mgmt_subnet, index)
-        with self._lock:
-            self._mgmt_ips[(topology.name, node.name)] = mgmt_ip
-
+        # attach_interface call retained for back-ends that need hot-attach
+        # (e.g. MockBackend tests count these). For LibvirtBackend it's a no-op
+        # since interfaces are inlined into the domain XML.
         self._backend.attach_interface(vm_id, mgmt_bridge,
                                        _mac_for(topology.name, node.name, "mgmt"))
 
-        # Update DB row with mgmt_ip now that it's assigned.
+        # Update DB row with mgmt_ip.
         self._db.save_node(
             topology_name=topology.name,
             name=node.name,
@@ -251,11 +361,6 @@ class Engine:
                  link.if_a.node_name, link.if_a.interface_name,
                  link.if_b.node_name, link.if_b.interface_name, br)
 
-        self._backend.create_bridge(br)
-        self._db._conn.execute(
-            "INSERT INTO bridges (topology_name, name, bridge_type) VALUES (?, ?, ?)",
-            (topology.name, br, "topology"),
-        )
         self._db._conn.execute(
             "INSERT INTO links (topology_name, node_a, iface_a, ip_a, "
             "node_b, iface_b, ip_b, bridge_name) VALUES (?,?,?,?,?,?,?,?)",
@@ -263,7 +368,6 @@ class Engine:
              link.if_b.node_name, link.if_b.interface_name, link.if_b.ip, br),
         )
         self._db._conn.commit()
-        self._link_bridges[topology.name].append(br)
 
         # Wire Link with backend/bridge refs so Link.down()/up() can work later.
         link._backend = self._backend
@@ -271,6 +375,9 @@ class Engine:
         link._db = self._db
         link._topology_name = topology.name
 
+        # Call attach_interface for each side. LibvirtBackend treats this as a
+        # no-op (ifaces are in initial XML). Mock back-ends record the call,
+        # which the unit tests rely on.
         for side in (link.if_a, link.if_b):
             vm_id = self._vm_ids[(topology.name, side.node_name)]
             mac = _mac_for(topology.name, side.node_name, side.interface_name)

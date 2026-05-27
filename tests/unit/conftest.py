@@ -95,6 +95,13 @@ class MockBackend:
         self._record("host_resources")
         return self.host_resources_result
 
+    def ssh_pubkey(self, topology_name: str) -> str:
+        self._record("ssh_pubkey", topology_name)
+        return f"ssh-ed25519 AAAAMOCK rangectl-{topology_name}"
+
+    def assign_host_ip(self, bridge: str, ip: str, cidr: str) -> None:
+        self._record("assign_host_ip", bridge, ip, cidr)
+
     def calls_of(self, name: str) -> list[tuple[tuple, dict]]:
         return [(a, k) for (n, a, k) in self.calls if n == name]
 

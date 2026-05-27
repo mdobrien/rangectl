@@ -36,9 +36,21 @@ def test_mgmt_host_ip():
 
 
 def test_bridge_name():
-    assert bridge_name("mytopo", 0) == "mytopo-br0"
-    assert bridge_name("mytopo", 5) == "mytopo-br5"
+    n0 = bridge_name("mytopo", 0)
+    n5 = bridge_name("mytopo", 5)
+    assert n0.startswith("rl-") and n0.endswith("-0")
+    assert n5.startswith("rl-") and n5.endswith("-5")
+    # Same topology name produces the same prefix.
+    assert n0.rsplit("-", 1)[0] == n5.rsplit("-", 1)[0]
+    # Different topologies don't collide.
+    assert bridge_name("other", 0) != n0
+    # Fits in Linux IFNAMSIZ-1 (15).
+    assert len(n0) <= 15 and len(n5) <= 15
 
 
 def test_mgmt_bridge_name():
-    assert mgmt_bridge_name("mytopo") == "rangectl-mgmt-mytopo"
+    assert mgmt_bridge_name("mytopo").startswith("rlmgt-")
+    assert len(mgmt_bridge_name("mytopo")) <= 15
+    # Stable + collision-resistant.
+    assert mgmt_bridge_name("mytopo") == mgmt_bridge_name("mytopo")
+    assert mgmt_bridge_name("mytopo") != mgmt_bridge_name("othertopo")

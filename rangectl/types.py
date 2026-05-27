@@ -73,6 +73,8 @@ class InterfaceSpec:
     interface_name: str
     ip: str | None = None
     cidr: str | None = None
+    bridge: str | None = None
+    mac: str | None = None
 
     def __getitem__(self, ip_cidr: str) -> InterfaceSpec:
         ip, cidr = ip_cidr.split("/", 1)
@@ -81,6 +83,8 @@ class InterfaceSpec:
             interface_name=self.interface_name,
             ip=ip,
             cidr=cidr,
+            bridge=self.bridge,
+            mac=self.mac,
         )
 
 
@@ -118,3 +122,7 @@ class VMSpec:
     interfaces: list[InterfaceSpec] = field(default_factory=list)
     inject: InjectMethod = InjectMethod.PRE_BAKED
     overlay_path: str | None = None
+    seed_iso_path: str | None = None
+    mgmt_ip: str | None = None
+    topology_name: str | None = None
+    ssh_user: str = "ubuntu"

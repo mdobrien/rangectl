@@ -33,6 +33,14 @@ class Backend(Protocol):
 
     def host_resources(self) -> HostResources: ...
 
+    # Optional capability: per-topology SSH keypair management.
+    # Returns the public key (one line OpenSSH format) for cloud-init injection.
+    def ssh_pubkey(self, topology_name: str) -> str: ...
+
+    # Optional capability: assign a host-side IP to a bridge so the host can
+    # reach VMs on that subnet.
+    def assign_host_ip(self, bridge: str, ip: str, cidr: str) -> None: ...
+
 
 @dataclass
 class HostResources:

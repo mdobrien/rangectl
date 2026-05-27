@@ -57,13 +57,14 @@ def test_deploy_records_backend_calls(backend, db):
 
 
 def test_deploy_saves_topology_to_db(backend, db):
+    from rangectl.networking import mgmt_bridge_name
     engine = Engine(backend, db)
     engine.deploy(_single_node_topo("saved"))
     row = db.get_topology("saved")
     assert row is not None
     assert row["name"] == "saved"
     assert row["mgmt_subnet"]
-    assert row["mgmt_bridge"] == "rangectl-mgmt-saved"
+    assert row["mgmt_bridge"] == mgmt_bridge_name("saved")
 
 
 def test_deploy_saves_nodes_to_db(backend, db):
@@ -82,13 +83,15 @@ def test_deploy_saves_nodes_to_db(backend, db):
 
 
 def test_deploy_two_nodes_with_link(backend, db):
+    from rangectl.networking import mgmt_bridge_name
     engine = Engine(backend, db)
     engine.deploy(_two_node_topo())
     # one topology bridge + one mgmt bridge
     bridges = [c[1][0] for c in backend.calls if c[0] == "create_bridge"]
-    assert "rangectl-mgmt-pair" in bridges
+    mgmt = mgmt_bridge_name("pair")
+    assert mgmt in bridges
     # one extra link bridge
-    assert len([b for b in bridges if b != "rangectl-mgmt-pair"]) == 1
+    assert len([b for b in bridges if b != mgmt]) == 1
     # each node attaches mgmt + topology interfaces = 4 attach_interface calls
     attaches = backend.calls_of("attach_interface")
     assert len(attaches) == 4

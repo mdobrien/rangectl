@@ -26,13 +26,13 @@ def test_free_mgmt_subnet_releases_for_reuse(db):
 
 
 def test_save_and_get_topology(db):
-    db.save_topology("t1", "active", "192.168.100.0/24", "rangectl-mgmt-t1")
+    db.save_topology("t1", "active", "192.168.100.0/24", "rlmgt-deadbe")
     row = db.get_topology("t1")
     assert row is not None
     assert row["name"] == "t1"
     assert row["status"] == "active"
     assert row["mgmt_subnet"] == "192.168.100.0/24"
-    assert row["mgmt_bridge"] == "rangectl-mgmt-t1"
+    assert row["mgmt_bridge"] == "rlmgt-deadbe"
 
 
 def test_get_topology_missing(db):

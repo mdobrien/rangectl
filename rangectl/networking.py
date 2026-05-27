@@ -1,11 +1,18 @@
 from __future__ import annotations
+import hashlib
 import ipaddress
 
 HOST_OFFSET = 254  # host always at .254 within a /24 mgmt subnet
+IFNAME_MAX = 15  # Linux IFNAMSIZ - 1
 
 
 def _net(subnet: str) -> ipaddress.IPv4Network:
     return ipaddress.IPv4Network(subnet, strict=False)
+
+
+def _short_topo(topology_name: str) -> str:
+    """6-char stable hash of the topology name, for use in Linux ifnames."""
+    return hashlib.sha1(topology_name.encode()).hexdigest()[:6]
 
 
 def allocate_mgmt_ip(subnet: str, index: int) -> str:
@@ -29,8 +36,10 @@ def mgmt_host_ip(subnet: str) -> str:
 
 
 def bridge_name(topology_name: str, index: int) -> str:
-    return f"{topology_name}-br{index}"
+    # Linux ifnames cap at 15 chars; hash the topology name so any topology
+    # name fits regardless of length.
+    return f"rl-{_short_topo(topology_name)}-{index}"
 
 
 def mgmt_bridge_name(topology_name: str) -> str:
-    return f"rangectl-mgmt-{topology_name}"
+    return f"rlmgt-{_short_topo(topology_name)}"

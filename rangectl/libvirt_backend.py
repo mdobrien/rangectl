@@ -1,0 +1,370 @@
+from __future__ import annotations
+import io
+import logging
+import os
+import socket
+import stat
+import subprocess
+import time
+from pathlib import Path
+from threading import Lock
+
+from rangectl.backend import HostResources
+from rangectl.types import ExecResult, VMSpec
+
+log = logging.getLogger(__name__)
+
+KEYS_ROOT = Path("~/.rangectl/keys").expanduser()
+SEED_ROOT = Path("~/.rangectl/seeds").expanduser()
+
+
+def _run(cmd: list[str], check: bool = True, capture: bool = True,
+         input_text: str | None = None) -> subprocess.CompletedProcess:
+    log.debug("RUN: %s", " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        capture_output=capture,
+        text=True,
+        input=input_text,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {' '.join(cmd)}\n"
+            f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
+        )
+    return result
+
+
+def _xml_for(spec: VMSpec) -> str:
+    """Build libvirt domain XML from VMSpec."""
+    if not spec.overlay_path:
+        raise ValueError("VMSpec.overlay_path required")
+    if not spec.seed_iso_path:
+        raise ValueError("VMSpec.seed_iso_path required")
+
+    iface_xml = []
+    for ifs in spec.interfaces:
+        if not ifs.bridge:
+            raise ValueError(
+                f"InterfaceSpec for {ifs.node_name}/{ifs.interface_name} "
+                "missing bridge — engine must populate it before create_vm"
+            )
+        if not ifs.mac:
+            raise ValueError(
+                f"InterfaceSpec for {ifs.node_name}/{ifs.interface_name} "
+                "missing mac — engine must populate it before create_vm"
+            )
+        iface_xml.append(f"""    <interface type='bridge'>
+      <source bridge='{ifs.bridge}'/>
+      <mac address='{ifs.mac}'/>
+      <model type='virtio'/>
+    </interface>""")
+
+    return f"""<domain type='kvm'>
+  <name>{spec.name}</name>
+  <memory unit='MiB'>{spec.memory}</memory>
+  <currentMemory unit='MiB'>{spec.memory}</currentMemory>
+  <vcpu>{spec.vcpu}</vcpu>
+  <os>
+    <type arch='x86_64' machine='q35'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+  <cpu mode='host-passthrough'/>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='{spec.overlay_path}'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{spec.seed_iso_path}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+{chr(10).join(iface_xml)}
+    <serial type='pty'><target port='0'/></serial>
+    <console type='pty'><target type='serial' port='0'/></console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+  </devices>
+</domain>"""
+
+
+class LibvirtBackend:
+    """Real backend that drives libvirt/QEMU via virsh + paramiko."""
+
+    def __init__(self, ssh_user: str = "ubuntu",
+                 ssh_ready_timeout: int = 180) -> None:
+        self._lock = Lock()
+        self._vm_mgmt_ip: dict[str, str] = {}
+        self._vm_topo: dict[str, str] = {}
+        self._topo_keys: dict[str, tuple[str, str]] = {}  # topo_name -> (priv_path, pubkey)
+        self._ssh_user = ssh_user
+        self._ssh_ready_timeout = ssh_ready_timeout
+        KEYS_ROOT.mkdir(parents=True, exist_ok=True)
+        SEED_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # --- topology-level helpers ---
+
+    def ssh_pubkey(self, topology_name: str) -> str:
+        with self._lock:
+            if topology_name in self._topo_keys:
+                return self._topo_keys[topology_name][1]
+            key_dir = KEYS_ROOT / topology_name
+            key_dir.mkdir(parents=True, exist_ok=True)
+            priv = key_dir / "id_ed25519"
+            pub = key_dir / "id_ed25519.pub"
+            if not priv.exists():
+                _run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv), "-q"])
+            os.chmod(priv, 0o600)
+            pubkey_text = pub.read_text().strip()
+            self._topo_keys[topology_name] = (str(priv), pubkey_text)
+            return pubkey_text
+
+    def _priv_key_for(self, topology_name: str) -> str:
+        with self._lock:
+            if topology_name not in self._topo_keys:
+                # Lazily reconstruct from disk if forgotten across processes.
+                priv = KEYS_ROOT / topology_name / "id_ed25519"
+                pub = KEYS_ROOT / topology_name / "id_ed25519.pub"
+                if priv.exists() and pub.exists():
+                    self._topo_keys[topology_name] = (str(priv), pub.read_text().strip())
+                else:
+                    raise RuntimeError(
+                        f"no ssh key for topology {topology_name!r}; "
+                        "call ssh_pubkey() first"
+                    )
+            return self._topo_keys[topology_name][0]
+
+    # --- VM lifecycle ---
+
+    def create_vm(self, spec: VMSpec) -> str:
+        log.info("create_vm: %s (mgmt_ip=%s, ifaces=%d)",
+                 spec.name, spec.mgmt_ip, len(spec.interfaces))
+        xml = _xml_for(spec)
+        log.debug("Domain XML for %s:\n%s", spec.name, xml)
+        _run(["virsh", "define", "/dev/stdin"], input_text=xml)
+        with self._lock:
+            if spec.mgmt_ip:
+                self._vm_mgmt_ip[spec.name] = spec.mgmt_ip
+            if spec.topology_name:
+                self._vm_topo[spec.name] = spec.topology_name
+        return spec.name
+
+    def start(self, vm_id: str) -> None:
+        log.info("start: %s", vm_id)
+        _run(["virsh", "start", vm_id])
+        mgmt_ip = self._vm_mgmt_ip.get(vm_id)
+        if mgmt_ip:
+            self._wait_for_ssh(mgmt_ip)
+
+    def stop(self, vm_id: str) -> None:
+        log.info("stop: %s", vm_id)
+        res = _run(["virsh", "shutdown", vm_id], check=False)
+        if res.returncode != 0:
+            log.warning("virsh shutdown failed for %s: %s", vm_id, res.stderr.strip())
+        # Allow graceful shutdown briefly; force-destroy on timeout.
+        for _ in range(15):
+            time.sleep(1)
+            state = self._dom_state(vm_id)
+            if state in ("shut off", None):
+                return
+        _run(["virsh", "destroy", vm_id], check=False)
+
+    def destroy(self, vm_id: str) -> None:
+        log.info("destroy: %s", vm_id)
+        _run(["virsh", "destroy", vm_id], check=False)
+        _run(["virsh", "undefine", vm_id, "--remove-all-storage", "--snapshots-metadata", "--nvram"], check=False)
+        with self._lock:
+            self._vm_mgmt_ip.pop(vm_id, None)
+            self._vm_topo.pop(vm_id, None)
+
+    def _dom_state(self, vm_id: str) -> str | None:
+        res = _run(["virsh", "domstate", vm_id], check=False)
+        return res.stdout.strip() if res.returncode == 0 else None
+
+    # --- snapshots ---
+
+    def snapshot(self, vm_id: str, name: str) -> str:
+        log.info("snapshot: %s -> %s", vm_id, name)
+        _run(["virsh", "snapshot-create-as", vm_id, name])
+        return name
+
+    def restore(self, vm_id: str, snapshot_id: str) -> None:
+        log.info("restore: %s @ %s", vm_id, snapshot_id)
+        _run(["virsh", "snapshot-revert", vm_id, snapshot_id])
+
+    # --- bridges & interfaces ---
+
+    def create_bridge(self, name: str) -> str:
+        log.info("create_bridge: %s", name)
+        # Idempotent: ignore "exists" errors.
+        res = _run(["ip", "link", "add", "name", name, "type", "bridge"], check=False)
+        if res.returncode != 0 and "exists" not in (res.stderr or ""):
+            raise RuntimeError(f"ip link add failed: {res.stderr}")
+        _run(["ip", "link", "set", name, "up"])
+        return name
+
+    def delete_bridge(self, name: str) -> None:
+        log.info("delete_bridge: %s", name)
+        _run(["ip", "link", "set", name, "down"], check=False)
+        _run(["ip", "link", "delete", name], check=False)
+
+    def assign_host_ip(self, bridge: str, ip: str, cidr: str) -> None:
+        log.info("assign_host_ip: %s -> %s/%s", bridge, ip, cidr)
+        res = _run(["ip", "addr", "add", f"{ip}/{cidr}", "dev", bridge], check=False)
+        if res.returncode != 0 and "exists" not in (res.stderr or ""):
+            raise RuntimeError(f"ip addr add failed: {res.stderr}")
+
+    def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
+        # Interfaces are inlined into the domain XML at create_vm time, so this
+        # is a no-op in normal deploy. Implemented for Link.up() hot-reattach
+        # scenarios (future work).
+        log.debug("attach_interface (no-op, baked into XML): %s %s %s",
+                  vm_id, bridge, mac)
+
+    def create_overlay(self, base_image: str, overlay_path: str) -> str:
+        log.info("create_overlay: %s -> %s", base_image, overlay_path)
+        Path(overlay_path).parent.mkdir(parents=True, exist_ok=True)
+        _run([
+            "qemu-img", "create",
+            "-f", "qcow2",
+            "-F", "qcow2",
+            "-b", base_image,
+            overlay_path,
+            "10G",
+        ])
+        # libvirt-qemu (running as the libvirt-qemu user under the stock
+        # AppArmor profile) needs to read the overlay. Group-libvirt is
+        # whitelisted on /var/lib/libvirt/images/**.
+        try:
+            os.chmod(overlay_path, 0o660)
+        except OSError:
+            pass
+        return overlay_path
+
+    # --- SSH / exec ---
+
+    def _wait_for_ssh(self, ip: str) -> None:
+        deadline = time.time() + self._ssh_ready_timeout
+        last_err = None
+        while time.time() < deadline:
+            try:
+                with socket.create_connection((ip, 22), timeout=3):
+                    # Port is open. Try a real handshake too — sshd may be up
+                    # before cloud-init has written authorized_keys.
+                    pass
+                return
+            except (OSError, socket.timeout) as exc:
+                last_err = exc
+                time.sleep(2)
+        raise RuntimeError(f"SSH not reachable on {ip} after "
+                           f"{self._ssh_ready_timeout}s: {last_err}")
+
+    def _ssh_client(self, vm_id: str):
+        import paramiko
+        ip = self._vm_mgmt_ip.get(vm_id)
+        topo = self._vm_topo.get(vm_id)
+        if not ip or not topo:
+            raise RuntimeError(
+                f"no mgmt_ip or topology recorded for vm {vm_id!r}"
+            )
+        key = paramiko.Ed25519Key.from_private_key_file(self._priv_key_for(topo))
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        last_err = None
+        for _ in range(30):
+            try:
+                client.connect(
+                    ip,
+                    username=self._ssh_user,
+                    pkey=key,
+                    timeout=5,
+                    auth_timeout=5,
+                    banner_timeout=10,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
+                return client
+            except Exception as exc:
+                last_err = exc
+                time.sleep(2)
+        raise RuntimeError(f"ssh connect to {ip} failed: {last_err}")
+
+    def exec(self, vm_id: str, cmd: str) -> ExecResult:
+        log.info("exec %s: %s", vm_id, cmd)
+        client = self._ssh_client(vm_id)
+        try:
+            stdin, stdout, stderr = client.exec_command(cmd, timeout=120)
+            rc = stdout.channel.recv_exit_status()
+            out = stdout.read().decode("utf-8", "replace")
+            err = stderr.read().decode("utf-8", "replace")
+            return ExecResult(exit_code=rc, stdout=out, stderr=err)
+        finally:
+            client.close()
+
+    def upload(self, vm_id: str, src: str, dst: str) -> None:
+        log.info("upload %s: %s -> %s", vm_id, src, dst)
+        client = self._ssh_client(vm_id)
+        try:
+            sftp = client.open_sftp()
+            try:
+                sftp.put(src, dst)
+            finally:
+                sftp.close()
+        finally:
+            client.close()
+
+    # --- resources ---
+
+    def host_resources(self) -> HostResources:
+        with open("/proc/cpuinfo") as f:
+            cpu_lines = f.read().splitlines()
+        total_vcpu = sum(1 for l in cpu_lines if l.startswith("processor"))
+
+        meminfo: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].endswith(":"):
+                    try:
+                        meminfo[parts[0][:-1]] = int(parts[1])  # KB
+                    except ValueError:
+                        pass
+        total_mem_mb = meminfo.get("MemTotal", 0) // 1024
+        avail_mem_mb = meminfo.get("MemAvailable", meminfo.get("MemFree", 0)) // 1024
+
+        # df on /var/lib/libvirt/images (or /) for available disk
+        df = _run(["df", "-Pm", "/var/lib/libvirt/images"], check=False)
+        if df.returncode != 0:
+            df = _run(["df", "-Pm", "/"])
+        rows = df.stdout.strip().splitlines()
+        if len(rows) >= 2:
+            cols = rows[-1].split()
+            total_disk_mb = int(cols[1])
+            avail_disk_mb = int(cols[3])
+        else:
+            total_disk_mb = 0
+            avail_disk_mb = 0
+
+        # Reserve some headroom for the host OS itself.
+        return HostResources(
+            total_vcpu=total_vcpu,
+            total_memory_mb=total_mem_mb,
+            total_disk_mb=total_disk_mb,
+            available_vcpu=max(1, total_vcpu - 1),
+            available_memory_mb=max(0, avail_mem_mb - 1024),
+            available_disk_mb=avail_disk_mb,
+        )
