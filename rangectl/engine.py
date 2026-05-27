@@ -142,6 +142,8 @@ class Engine:
                 name=node.name,
                 mgmt_ip=mgmt_ip,
                 topology_name=topology.name,
+                backend=self._backend,
+                vm_id=self._vm_ids[(topology.name, node.name)],
             )
         log.info("Deployment complete")
         return rng
@@ -271,11 +273,52 @@ class Engine:
                 self._db.update_node_state(topology.name, node.name, node.state.value)
 
     def _inject_dependencies(self, topology: Topology, node: Node) -> None:
-        log.info("[%s/%s] Injecting dependencies (stub)", topology.name, node.name)
-        # Phase 3: nodes without links never reach LINKED — bridge that gap.
+        log.info("[%s/%s] Injecting dependencies", topology.name, node.name)
+        # Nodes without links never reach LINKED via _wire_link — bridge that gap.
         if node.state == NodeState.READY:
             node.state = transition_node_state(node.state, NodeState.LINKED)
             self._db.update_node_state(topology.name, node.name, node.state.value)
+
+        vm_id = self._vm_ids[(topology.name, node.name)]
+        mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
+        live = LiveNode(
+            name=node.name,
+            mgmt_ip=mgmt_ip,
+            topology_name=topology.name,
+            backend=self._backend,
+            vm_id=vm_id,
+        )
+
+        # 1. packages — Linux uses apt-get; Windows uses powershell commands.
+        if node.os_type == OSType.LINUX and node._packages:
+            pkg_list = " ".join(node._packages)
+            self._backend.exec(vm_id, f"apt-get install -y {pkg_list}")
+        for ps_cmd in node._powershell_commands:
+            self._backend.exec(vm_id, f"powershell -Command {ps_cmd}")
+
+        # 2. files — upload each registered file.
+        for dst, src in node._files:
+            self._backend.upload(vm_id, src, dst)
+
+        # 3. installs — upload source, run install, optionally verify.
+        for inst in node._installs:
+            remote_src = f"/tmp/{Path(inst.src).name}"
+            self._backend.upload(vm_id, inst.src, remote_src)
+            self._backend.exec(vm_id, inst.install_cmd)
+            if inst.verify_cmd:
+                self._backend.exec(vm_id, inst.verify_cmd)
+
+        # 4. configure functions — pass a LiveNode bound to the backend.
+        for fn in node._configure_fns:
+            fn(live)
+
+        # 5. services — enable then start.
+        for svc in node._services:
+            if svc.enabled:
+                self._backend.exec(vm_id, f"systemctl enable {svc.name}")
+            start_cmd = svc.start_cmd or f"systemctl start {svc.name}"
+            self._backend.exec(vm_id, start_cmd)
+
         if node.state == NodeState.LINKED:
             node.state = transition_node_state(node.state, NodeState.RUNNING)
             self._db.update_node_state(topology.name, node.name, node.state.value)

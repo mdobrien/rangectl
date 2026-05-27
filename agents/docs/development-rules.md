@@ -1,5 +1,7 @@
 # rangectl Development Rules
 
+> **Audience: coding agents.** Token-optimized reference for the Python test harness (`testharness/`). For design rationale see `scratch/issues/20260309-2-test-harness-phased-plan.md`.
+
 ## TDD Workflow (Non-Negotiable)
 
 Every code change follows this exact sequence:
@@ -30,7 +32,7 @@ Never skip step 1. Never commit with failing tests.
 - Test real VMs, real bridges, real SSH connections
 - Slow (minutes)
 - Required for any code that touches libvirt, networking, or SSH
-- Run before merge: `pytest tests/integration`
+- Must pass before a phase is deemed complete: `pytest tests/integration`
 
 ### Running Tests
 

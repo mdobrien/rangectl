@@ -147,12 +147,114 @@ GitHub Actions self-hosted runner on EC2 box:
 
 ## What Gets Tested Per Phase
 
-| Phase | Unit Tests | Integration Tests |
-|---|---|---|
-| 1: Backend + Libvirt | MockBackend, StateDB schema, resource validation | VM create/start/stop/destroy via libvirt |
-| 2: Networking | IP allocation, subnet math, bridge naming | Bridge create, tap wiring, ping connectivity |
-| 3: State Machine + DAG | State transitions, topo-sort, wave computation | Full deploy with readiness probes |
-| 4: Image Registry | Metadata CRUD in SQLite | Boot-and-snapshot image build |
-| 5: Dependencies | Ordering, apply(), configure registration | SSH exec, package install, file upload |
-| 6: SDK Surface | Topology/Node/Link API, export/import | End-to-end topology lifecycle |
-| 7: Windows | Windows-specific dep resolution | Windows VM boot, cloudbase-init, WinRM |
+| Phase | Unit Tests | Integration Tests | Test Topologies |
+|---|---|---|---|
+| 0: EC2 Setup | N/A | KVM works, base images exist, smoke test VM | Manual virsh smoke test |
+| 1-2: Backend + Networking | MockBackend, StateDB schema, resource validation, IP allocation, subnet math, bridge naming | VM create/start/stop/destroy, bridge create, tap wiring, ping | Topo 1, Topo 2 |
+| 3: State Machine + DAG | State transitions, topo-sort, wave computation | Full deploy with readiness probes | Topo 2, Topo 4 |
+| 4-5: Images + Dependencies | Metadata CRUD, ordering, apply(), configure registration | Boot-and-snapshot image build, SSH exec, package install, file upload | Topo 3 |
+| 6: SDK Surface | Topology/Node/Link API, export/import | End-to-end topology lifecycle, link toggle, multi-topology isolation | Topo 4, Topo 5, Topo 6 |
+
+## Test Topologies
+
+Progressive topologies that validate features phase by phase. A phase is not complete until its topologies deploy, pass all assertions, and destroy cleanly.
+
+### Topo 1: Two Ubuntu VMs (Phase 1-2)
+Simplest possible. Validates VM lifecycle, mgmt network, basic connectivity.
+
+```
+ubuntu-a ---- ubuntu-b
+         10.0.1.0/24
+
+mgmt: rangectl-mgmt-test1
+host at .254, ubuntu-a at .1, ubuntu-b at .2
+```
+
+**Validates**:
+- VM create/start/destroy
+- COW overlays from base image
+- Mgmt network (host can SSH to both via mgmt IPs)
+- Single topology bridge
+- Ping between nodes on topology link
+
+### Topo 2: Two Ubuntu VMs + VyOS Router (Phase 2-3)
+Two subnets, VyOS routing between them. First dependency chain.
+
+```
+ubuntu-a ---- vyos-router ---- ubuntu-b
+  10.0.1.0/24             10.0.2.0/24
+```
+
+**Validates**:
+- `depends_on` (ubuntu nodes depend on router)
+- Wave-based deploy (wave 1: router, wave 2: ubuntu-a + ubuntu-b)
+- Readiness probes (L2 ping for all, L3 port_open(22) for router)
+- Multi-subnet routing
+- Different OS images in same topology
+- Cross-subnet connectivity (ubuntu-a pings ubuntu-b through router)
+
+### Topo 3: Services + DependencySet (Phase 4-5)
+Web server behind a router, with dependency injection.
+
+```
+attacker ---- vyos-router ---- web-server
+  10.0.1.0/24             10.0.2.0/24
+```
+
+**Validates**:
+- `packages(["nginx"])` on web-server
+- `DependencySet` applied to a node
+- `@configure` decorator (template a config file using router's IP)
+- `service("nginx", enabled=True, ready_when=port_open(80))`
+- L3 readiness (web-server not "ready" until nginx responds on 80)
+- `exec()` from attacker to curl the web server through the router
+
+### Topo 4: Diamond Dependency + Snapshot (Phase 3, 6)
+Complex DAG — tests wave computation and snapshot/restore.
+
+```
+              ┌── web-server ──┐
+router ──────┤                 ├── monitor
+              └── db-server  ──┘
+  10.0.1.0/24    10.0.2.0/24     10.0.3.0/24
+```
+
+**Validates**:
+- Diamond dependency: monitor depends on both web-server and db-server, both depend on router
+- Three waves: [router] → [web-server, db-server] → [monitor]
+- Topology-wide `rng.snapshot("baseline")`
+- Make a change (install a package, modify a file)
+- `rng.restore("baseline")` — verify change is reverted
+- Per-node snapshot/restore
+
+### Topo 5: Link Toggling + Fault Injection (Phase 6)
+Exercises imperative interaction.
+
+```
+ubuntu-a ---- vyos-router ---- ubuntu-b
+  10.0.1.0/24             10.0.2.0/24
+```
+
+**Validates**:
+- `rng.link("router", "ubuntu-b").down()` — ubuntu-a can't reach ubuntu-b
+- `rng.link("router", "ubuntu-b").up()` — connectivity restored
+- Logs capture link state changes
+- `rng.logs()` returns structured entries for toggle events
+
+### Topo 6: Multi-Topology Isolation (Phase 6)
+Two topologies deployed simultaneously. Validates namespace isolation.
+
+```
+Topology "red-team":                Topology "blue-team":
+  attacker -- router -- target        siem -- sensor
+  10.0.1.0/24     10.0.2.0/24        172.16.0.0/24
+
+  mgmt: 192.168.100.0/24             mgmt: 192.168.101.0/24
+```
+
+**Validates**:
+- Two topologies coexist, separate mgmt bridges and subnets
+- No cross-topology connectivity on mgmt network
+- Independent deploy/destroy lifecycle
+- `list_topologies()` shows both
+- Destroy one, other is unaffected

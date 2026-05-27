@@ -183,18 +183,29 @@ class Range:
 class LiveNode:
     """Handle to a running node within a deployed topology."""
 
-    def __init__(self, name: str, mgmt_ip: str, topology_name: str) -> None:
+    def __init__(self, name: str, mgmt_ip: str, topology_name: str,
+                 backend: Any = None, vm_id: str | None = None) -> None:
         self.name = name
         self.mgmt_ip = mgmt_ip
         self.topology_name = topology_name
+        self._backend = backend
+        self._vm_id = vm_id
 
     def exec(self, command: str) -> ExecResult:
         log.info("[%s/%s] exec: %s", self.topology_name, self.name, command)
-        raise NotImplementedError
+        if self._backend is None or self._vm_id is None:
+            raise RuntimeError(
+                f"LiveNode {self.name!r} not bound to a backend; cannot exec"
+            )
+        return self._backend.exec(self._vm_id, command)
 
     def upload(self, src: str, dst: str) -> None:
         log.info("[%s/%s] upload: %s -> %s", self.topology_name, self.name, src, dst)
-        raise NotImplementedError
+        if self._backend is None or self._vm_id is None:
+            raise RuntimeError(
+                f"LiveNode {self.name!r} not bound to a backend; cannot upload"
+            )
+        self._backend.upload(self._vm_id, src, dst)
 
     def template(self, src: str, dst: str, vars: dict[str, Any] | None = None) -> None:
         log.info("[%s/%s] template: %s -> %s (vars=%s)", self.topology_name, self.name, src, dst, vars)

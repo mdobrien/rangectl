@@ -69,6 +69,37 @@ Core problem: GNS3 has the right mental model but terrible execution (race condi
 
 ## Implementation Phases
 
+### Phase 0: EC2 Environment Setup
+Create `scratch/scripts/ec2-bootstrap.sh` that does everything below. Agent runs it on the EC2 box and walks away.
+
+**System dependencies** (apt):
+- `qemu-kvm`, `libvirt-daemon-system`, `libvirt-clients`, `virtinst`
+- `bridge-utils`, `net-tools`, `cloud-image-utils` (for cloud-init seed ISOs)
+- `python3-pip`, `python3-venv`
+
+**User/group setup**:
+- Add ubuntu user to `libvirt` and `kvm` groups
+
+**Python dependencies** (pip):
+- `libvirt-python`, `paramiko`, `pytest`, `pyyaml`, `jinja2`
+
+**Download pre-built cloud images** (no building — these are published qcow2s):
+- Ubuntu 22.04: `https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img`
+- Ubuntu 24.04: `https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img`
+- VyOS: rolling release qcow2 from `https://github.com/vyos/vyos-rolling-nightly-builds/releases`
+- Store in `~/.rangectl/images/`
+
+**Smoke test**:
+- `kvm-ok` returns success
+- `virsh list --all` works
+- Boot Ubuntu 22.04 cloud image via `virt-install` with a cloud-init seed ISO (inject a test SSH key), confirm it starts, SSH in, destroy it
+
+**Validation** (script exits non-zero if any fail):
+- KVM enabled
+- libvirt daemon running
+- All three base images exist in `~/.rangectl/images/`
+- Smoke test VM booted, SSH'd, and destroyed cleanly
+
 ### Phase 1: Backend Interface + Libvirt (VM lifecycle)
 - `Backend` protocol definition
 - `LibvirtBackend`: create, start, stop, destroy VMs

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import shutil
 from pathlib import Path
 
 from rangectl.dependencies import DependencyMixin
@@ -26,13 +27,18 @@ class ImageRegistry:
     ) -> None:
         inject_str = inject.value if isinstance(inject, InjectMethod) else inject
         log.info("Registering image: %s from %s (inject=%s)", name, path, inject_str)
-        # copy qcow2 to storage directory, record in DB
-        raise NotImplementedError
+        src = Path(path)
+        dest = self._storage_path / f"{name}.qcow2"
+        shutil.copy2(str(src), str(dest))
+        size_mb = dest.stat().st_size // (1024 * 1024)
+        self._db.add_image(name, str(dest), inject_str, os_type, size_mb)
 
     def remove(self, name: str) -> None:
         log.info("Removing image: %s", name)
-        # delete qcow2 from storage, remove from DB
-        raise NotImplementedError
+        record = self._db.get_image(name)
+        if record:
+            Path(record["path"]).unlink(missing_ok=True)
+            self._db.remove_image(name)
 
     def list(self) -> list[dict]:
         log.info("Listing images")

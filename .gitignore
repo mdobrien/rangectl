@@ -6,3 +6,5 @@ build/
 .eggs/
 *.db
 .venv/
+.ec2-config
+.ec2-state
