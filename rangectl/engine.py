@@ -144,7 +144,11 @@ class Engine:
                 topology_name=topology.name,
                 backend=self._backend,
                 vm_id=self._vm_ids[(topology.name, node.name)],
+                db=self._db,
             )
+        rng._engine = self
+        rng._db = self._db
+        rng._backend = self._backend
         log.info("Deployment complete")
         return rng
 
@@ -260,6 +264,12 @@ class Engine:
         )
         self._db._conn.commit()
         self._link_bridges[topology.name].append(br)
+
+        # Wire Link with backend/bridge refs so Link.down()/up() can work later.
+        link._backend = self._backend
+        link._bridge_name = br
+        link._db = self._db
+        link._topology_name = topology.name
 
         for side in (link.if_a, link.if_b):
             vm_id = self._vm_ids[(topology.name, side.node_name)]

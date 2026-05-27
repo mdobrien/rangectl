@@ -25,8 +25,8 @@
 | 0 | EC2 Setup | `20260527-6-phase0-ec2-bootstrap.md` | #1 | BLOCKED | N/A | bootstrap validates | Blocked: AWS vCPU quota (16) too low for bare-metal. Increase requested 2026-05-27. Script ready. |
 | 1-2 | Backend + Networking | `20260527-7-phase1-2-backend-networking.md` | #2 | Gate 1 DONE, Gate 2 deferred | 31/31 pass | Topo 1, Topo 2 | Gate 2 deferred until EC2 ready |
 | 3 | State Machine + DAG | `20260527-8-phase3-state-machine-dag.md` | #3 | Gate 1 DONE, Gate 2 deferred | 64/64 pass | Topo 2, Topo 4 | Gate 2 deferred |
-| 4-5 | Images + Dependencies | `20260527-9-phase4-5-images-dependencies.md` | #4 | In Progress (Gate 1 only) | unit | Topo 3 | Gate 2 deferred |
-| 6 | SDK Surface | | #5 | Blocked by #4 | unit | Topo 4, Topo 5, Topo 6 | |
+| 4-5 | Images + Dependencies | `20260527-9-phase4-5-images-dependencies.md` | #4 | Gate 1 DONE, Gate 2 deferred | 91/91 pass | Topo 3 | Gate 2 deferred |
+| 6 | SDK Surface | `20260527-10-phase6-sdk-surface.md` | #5 | In Progress (Gate 1 only) | unit | Topo 4, Topo 5, Topo 6 | Gate 2 deferred |
 
 ## Progress Log
 
@@ -77,3 +77,18 @@
 - Notes: StateDB made thread-safe (check_same_thread=False + RLock) for parallel wave deploys
 - Notes: Nodes without links go READY→LINKED→RUNNING in _inject_dependencies
 - Notes: Deterministic MAC from sha1(topo/node/suffix), overlay at ~/.rangectl/overlays/{topo}/{node}.qcow2
+
+### Phase 4-5 — Gate 1 Complete (commit b9be02f)
+- Agent: `phase4-5-coder` — shut down
+- Gate 1: 91/91 pytest tests/unit (27 new: 9 images, 7 dependencies, 11 inject)
+- Gate 2: DEFERRED
+- Files created: `tests/unit/test_images.py`, `tests/unit/test_dependencies.py`, `tests/unit/test_inject.py`
+- Files modified: `rangectl/images.py`, `rangectl/engine.py`, `rangectl/topology.py`
+- Key APIs built:
+  - `ImageRegistry.add(name, path, inject, os_type)` — copies qcow2, records in DB
+  - `ImageRegistry.remove(name)` — deletes file + DB record
+  - `Engine._inject_dependencies()` — packages → files → installs → configure → services
+  - `LiveNode.exec(cmd) → ExecResult` — routes through backend
+  - `LiveNode.upload(src, dst)` — routes through backend
+- Notes: LiveNode gained optional backend/vm_id fields for configure function support
+- Notes: ImageBuilder.build() intentionally left as NotImplementedError (needs real VMs)
