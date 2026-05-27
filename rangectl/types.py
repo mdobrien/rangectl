@@ -23,6 +23,31 @@ class NodeState(Enum):
     FAILED = "failed"
 
 
+VALID_TRANSITIONS: dict["NodeState", set["NodeState"]] = {
+    NodeState.DEFINED: {NodeState.PROVISIONING, NodeState.FAILED},
+    NodeState.PROVISIONING: {NodeState.READY, NodeState.FAILED},
+    NodeState.READY: {NodeState.LINKED, NodeState.FAILED},
+    NodeState.LINKED: {NodeState.RUNNING, NodeState.FAILED},
+    NodeState.RUNNING: {NodeState.DESTROYING, NodeState.FAILED},
+    NodeState.DESTROYING: {NodeState.DESTROYED, NodeState.FAILED},
+    NodeState.DESTROYED: set(),
+    NodeState.FAILED: set(),
+}
+
+
+class InvalidTransitionError(Exception):
+    pass
+
+
+def transition_node_state(current: "NodeState", target: "NodeState") -> "NodeState":
+    """Validate the transition and return the new state, or raise."""
+    if target not in VALID_TRANSITIONS.get(current, set()):
+        raise InvalidTransitionError(
+            f"cannot transition {current.value} -> {target.value}"
+        )
+    return target
+
+
 class InjectMethod(Enum):
     PRE_BAKED = "pre-baked"
     CLOUD_INIT = "cloud-init"

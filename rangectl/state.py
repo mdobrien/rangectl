@@ -2,6 +2,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -107,7 +108,11 @@ class StateDB:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._path = str(path)
         log.info("StateDB opening at %s", self._path)
-        self._conn = sqlite3.connect(self._path)
+        # check_same_thread=False so wave-parallel deploys can write from worker
+        # threads. The lock below serializes access — sqlite itself isn't safe
+        # to share without it.
+        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        self._lock = threading.RLock()
         if self._path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -119,64 +124,70 @@ class StateDB:
 
     def allocate_mgmt_subnet(self, topology_name: str) -> str:
         log.info("Allocating mgmt subnet for topology '%s'", topology_name)
-        cur = self._conn.execute("SELECT subnet FROM mgmt_subnets")
-        taken = {row[0] for row in cur.fetchall()}
-        base = int(MGMT_POOL_BASE.network_address)
-        for i in range(MGMT_POOL_SIZE):
-            candidate_net = ipaddress.IPv4Network((base + i * 256, MGMT_POOL_PREFIX))
-            candidate = f"{candidate_net.network_address}/{MGMT_POOL_PREFIX}"
-            if candidate not in taken:
-                self._conn.execute(
-                    "INSERT INTO mgmt_subnets (subnet, topology_name) VALUES (?, ?)",
-                    (candidate, topology_name),
-                )
-                self._conn.commit()
-                return candidate
-        raise RuntimeError("mgmt subnet pool exhausted")
+        with self._lock:
+            cur = self._conn.execute("SELECT subnet FROM mgmt_subnets")
+            taken = {row[0] for row in cur.fetchall()}
+            base = int(MGMT_POOL_BASE.network_address)
+            for i in range(MGMT_POOL_SIZE):
+                candidate_net = ipaddress.IPv4Network((base + i * 256, MGMT_POOL_PREFIX))
+                candidate = f"{candidate_net.network_address}/{MGMT_POOL_PREFIX}"
+                if candidate not in taken:
+                    self._conn.execute(
+                        "INSERT INTO mgmt_subnets (subnet, topology_name) VALUES (?, ?)",
+                        (candidate, topology_name),
+                    )
+                    self._conn.commit()
+                    return candidate
+            raise RuntimeError("mgmt subnet pool exhausted")
 
     def free_mgmt_subnet(self, topology_name: str) -> None:
         log.info("Freeing mgmt subnet for topology '%s'", topology_name)
-        self._conn.execute(
-            "DELETE FROM mgmt_subnets WHERE topology_name=?", (topology_name,)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM mgmt_subnets WHERE topology_name=?", (topology_name,)
+            )
+            self._conn.commit()
 
     def save_topology(self, name: str, status: str, mgmt_subnet: str, mgmt_bridge: str) -> None:
         log.info("Saving topology '%s' (status=%s)", name, status)
-        self._conn.execute(
-            "INSERT OR REPLACE INTO topologies (name, status, mgmt_subnet, mgmt_bridge) "
-            "VALUES (?, ?, ?, ?)",
-            (name, status, mgmt_subnet, mgmt_bridge),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO topologies (name, status, mgmt_subnet, mgmt_bridge) "
+                "VALUES (?, ?, ?, ?)",
+                (name, status, mgmt_subnet, mgmt_bridge),
+            )
+            self._conn.commit()
 
     def save_node(self, topology_name: str, name: str, image: str, vcpu: int,
                   memory_mb: int, os_type: str, state: str, mgmt_ip: str | None = None) -> None:
         log.info("Saving node '%s/%s' (state=%s)", topology_name, name, state)
-        self._conn.execute(
-            "INSERT OR REPLACE INTO nodes "
-            "(topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO nodes "
+                "(topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip),
+            )
+            self._conn.commit()
 
     def update_node_state(self, topology_name: str, name: str, state: str) -> None:
         log.info("Updating node state '%s/%s' -> %s", topology_name, name, state)
-        self._conn.execute(
-            "UPDATE nodes SET state=? WHERE topology_name=? AND name=?",
-            (state, topology_name, name),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE nodes SET state=? WHERE topology_name=? AND name=?",
+                (state, topology_name, name),
+            )
+            self._conn.commit()
 
     def log_event(self, topology_name: str, node_name: str | None,
                   level: str, message: str) -> None:
         log.info("[%s/%s] %s: %s", topology_name, node_name or "*", level, message)
-        self._conn.execute(
-            "INSERT INTO logs (topology_name, node_name, level, message) VALUES (?, ?, ?, ?)",
-            (topology_name, node_name, level, message),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO logs (topology_name, node_name, level, message) VALUES (?, ?, ?, ?)",
+                (topology_name, node_name, level, message),
+            )
+            self._conn.commit()
 
     def get_logs(self, topology_name: str, node_name: str | None = None,
                  level: str | None = None) -> list[dict]:
