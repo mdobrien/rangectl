@@ -7,6 +7,7 @@ every QEMU process it spawns are born into it.
 """
 from __future__ import annotations
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ log = logging.getLogger(__name__)
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 CPU_PERIOD = 100000  # microseconds per scheduling period
+DRAIN_TIMEOUT = 5.0  # seconds to wait for cgroup.procs to empty after kill
 
 
 @dataclass
@@ -57,14 +59,40 @@ def create_cgroup(range_name: str, resources: Resources) -> str:
 
 
 def destroy_cgroup(range_name: str) -> None:
-    """Remove the range cgroup. A cgroup directory is removed with rmdir once
-    empty of processes; absent is a no-op."""
+    """Remove the range cgroup. rmdir only succeeds on an empty cgroup, so first
+    kill any surviving members (atomically, via ``cgroup.kill``) and wait for
+    ``cgroup.procs`` to drain. Absent control files (e.g. the unit-test tmp dir)
+    or an absent cgroup are no-ops."""
     cg = _cgroup_path(range_name)
     log.info("destroy_cgroup: %s", cg)
+    _kill_and_drain(cg)
     try:
         cg.rmdir()
     except FileNotFoundError:
         pass
+
+
+def _kill_and_drain(cg: Path) -> None:
+    """SIGKILL every process in the cgroup (and descendants) and wait for the
+    cgroup to empty, so the subsequent rmdir does not hit EBUSY."""
+    kill_file = cg / "cgroup.kill"
+    if not kill_file.exists():
+        # No cgroup.kill (cgroup gone, or a plain tmp dir in tests): nothing to
+        # kill. Treat as already drained.
+        return
+    kill_file.write_text("1")
+
+    procs = cg / "cgroup.procs"
+    deadline = time.time() + DRAIN_TIMEOUT
+    while time.time() < deadline:
+        try:
+            if not procs.read_text().strip():
+                return
+        except FileNotFoundError:
+            return
+        time.sleep(0.1)
+    log.warning("cgroup %s did not drain within %ss; rmdir may fail",
+                cg, DRAIN_TIMEOUT)
 
 
 def freeze(range_name: str) -> None:

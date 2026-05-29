@@ -204,17 +204,31 @@ def create_range(name: str, mgmt_subnet: str,
     return info
 
 
-def _terminate(pid: int) -> None:
-    """SIGTERM then SIGKILL the libvirtd host-PID; tolerate it already gone."""
+def _signal(pid: int, sig: int) -> bool:
+    """Send ``sig`` to ``pid``; return False if the process is already gone."""
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, sig)
+        return True
     except ProcessLookupError:
+        return False
+
+
+def _terminate(wrapper_pid: int) -> None:
+    """Kill the libvirtd tree rooted at the ``unshare`` wrapper.
+
+    The wrapper only forks libvirtd; libvirtd is PID 1 of the range's pid-ns and
+    owns every QEMU. Killing the wrapper alone leaves libvirtd (and its QEMU)
+    leaked, which holds the range cgroup non-empty (rmdir EBUSY) and contends
+    for host resources. So SIGTERM the wrapper's children (libvirtd) *and* the
+    wrapper, grace, then SIGKILL survivors — killing libvirtd makes the kernel
+    reap its QEMU children."""
+    targets = _child_pids(wrapper_pid) + [wrapper_pid]
+    survivors = [pid for pid in targets if _signal(pid, signal.SIGTERM)]
+    if not survivors:
         return
     time.sleep(TERM_GRACE_SECONDS)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    for pid in survivors:
+        _signal(pid, signal.SIGKILL)
 
 
 def destroy_range(name: str, range_dir: str = DEFAULT_RANGE_DIR) -> None:
