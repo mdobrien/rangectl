@@ -43,3 +43,17 @@ def bridge_name(topology_name: str, index: int) -> str:
 
 def mgmt_bridge_name(topology_name: str) -> str:
     return f"rlmgt-{_short_topo(topology_name)}"
+
+
+# --- netns-scoped names (v2) ---------------------------------------------
+# Inside a range's network namespace, bridge names are scoped to the namespace,
+# so collisions across ranges are impossible and no hashing is needed. These
+# clean names replace the hashed ones once the engine is wired for per-range
+# namespaces (Phase 11). The hashed helpers above remain for backward compat.
+
+def ns_bridge_name(index: int) -> str:
+    return f"data-{index}"
+
+
+def ns_mgmt_bridge_name() -> str:
+    return "mgmt-br"

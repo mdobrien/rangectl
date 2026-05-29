@@ -108,7 +108,16 @@ class LibvirtBackend:
     """Real backend that drives libvirt/QEMU via virsh + paramiko."""
 
     def __init__(self, ssh_user: str = "ubuntu",
-                 ssh_ready_timeout: int = 180) -> None:
+                 ssh_ready_timeout: int = 180,
+                 libvirt_socket: str | None = None,
+                 netns_name: str | None = None) -> None:
+        # When libvirt_socket is set, virsh connects to this range's per-range
+        # libvirtd over its unix socket. When netns_name is set, bridge/IP
+        # operations execute inside that network namespace (clean bridge
+        # names, structural isolation). Both default to None for legacy
+        # host-level behaviour, preserving existing integration tests.
+        self._libvirt_socket = libvirt_socket
+        self._netns_name = netns_name
         self._lock = Lock()
         self._vm_mgmt_ip: dict[str, str] = {}
         self._vm_topo: dict[str, str] = {}
@@ -120,6 +129,28 @@ class LibvirtBackend:
         self._ssh_ready_timeout = ssh_ready_timeout
         KEYS_ROOT.mkdir(parents=True, exist_ok=True)
         SEED_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # --- per-range command builders ---
+
+    def _virsh(self, *args: str) -> list[str]:
+        """Build a virsh command, adding the per-range connection URI when a
+        libvirt socket is configured."""
+        if self._libvirt_socket:
+            return ["virsh", "-c",
+                    f"qemu+unix:///system?socket={self._libvirt_socket}",
+                    *args]
+        return ["virsh", *args]
+
+    def _ip(self, *args: str) -> list[str]:
+        """Build an ip/network command, prefixing ``ip netns exec`` when a
+        network namespace is configured so bridges/IPs land inside the range."""
+        if self._netns_name:
+            return ["ip", "netns", "exec", self._netns_name, *args]
+        return list(args)
+
+    def _virsh_console_cmd(self, vm_id: str) -> str:
+        """Console command string for pexpect, socket-aware."""
+        return " ".join(self._virsh("console", vm_id))
 
     # --- topology-level helpers ---
 
@@ -228,7 +259,7 @@ class LibvirtBackend:
 
         log.info("[%s] bootstrapping VyOS via serial console (%d cmds)",
                  vm_id, len(cmds))
-        child = pexpect.spawn(f"virsh console {vm_id}", encoding="utf-8",
+        child = pexpect.spawn(self._virsh_console_cmd(vm_id), encoding="utf-8",
                               timeout=180)
         log_buf: list[str] = []
         child.logfile_read = type("Tee", (), {
@@ -321,7 +352,7 @@ class LibvirtBackend:
                  spec.name, spec.mgmt_ip, len(spec.interfaces))
         xml = _xml_for(spec)
         log.debug("Domain XML for %s:\n%s", spec.name, xml)
-        _run(["virsh", "define", "/dev/stdin"], input_text=xml)
+        _run(self._virsh("define", "/dev/stdin"), input_text=xml)
         with self._lock:
             if spec.mgmt_ip:
                 self._vm_mgmt_ip[spec.name] = spec.mgmt_ip
@@ -333,7 +364,7 @@ class LibvirtBackend:
 
     def start(self, vm_id: str) -> None:
         log.info("start: %s", vm_id)
-        _run(["virsh", "start", vm_id])
+        _run(self._virsh("start", vm_id))
         # When a VyOS image is in use cloud-init never runs, so we have to
         # drive the serial console to assign the mgmt IP and install the
         # topology pubkey before SSH on the mgmt subnet will work. The engine
@@ -348,7 +379,7 @@ class LibvirtBackend:
 
     def stop(self, vm_id: str) -> None:
         log.info("stop: %s", vm_id)
-        res = _run(["virsh", "shutdown", vm_id], check=False)
+        res = _run(self._virsh("shutdown", vm_id), check=False)
         if res.returncode != 0:
             log.warning("virsh shutdown failed for %s: %s", vm_id, res.stderr.strip())
         # Allow graceful shutdown briefly; force-destroy on timeout.
@@ -357,12 +388,12 @@ class LibvirtBackend:
             state = self._dom_state(vm_id)
             if state in ("shut off", None):
                 return
-        _run(["virsh", "destroy", vm_id], check=False)
+        _run(self._virsh("destroy", vm_id), check=False)
 
     def destroy(self, vm_id: str) -> None:
         log.info("destroy: %s", vm_id)
-        _run(["virsh", "destroy", vm_id], check=False)
-        _run(["virsh", "undefine", vm_id, "--remove-all-storage", "--snapshots-metadata", "--nvram"], check=False)
+        _run(self._virsh("destroy", vm_id), check=False)
+        _run(self._virsh("undefine", vm_id, "--remove-all-storage", "--snapshots-metadata", "--nvram"), check=False)
         with self._lock:
             self._vm_mgmt_ip.pop(vm_id, None)
             self._vm_topo.pop(vm_id, None)
@@ -371,28 +402,28 @@ class LibvirtBackend:
             self._vyos_bootstrap.pop(vm_id, None)
 
     def _dom_state(self, vm_id: str) -> str | None:
-        res = _run(["virsh", "domstate", vm_id], check=False)
+        res = _run(self._virsh("domstate", vm_id), check=False)
         return res.stdout.strip() if res.returncode == 0 else None
 
     # --- snapshots ---
 
     def snapshot(self, vm_id: str, name: str) -> str:
         log.info("snapshot: %s -> %s", vm_id, name)
-        _run(["virsh", "snapshot-create-as", vm_id, name])
+        _run(self._virsh("snapshot-create-as", vm_id, name))
         return name
 
     def restore(self, vm_id: str, snapshot_id: str) -> None:
         log.info("restore: %s @ %s", vm_id, snapshot_id)
-        _run(["virsh", "snapshot-revert", vm_id, snapshot_id])
+        _run(self._virsh("snapshot-revert", vm_id, snapshot_id))
         # snapshot-revert can leave the domain in a non-running state depending
         # on how the snapshot was created (disk-only -> shut off; some kernels
         # -> paused). Force the VM back to running so SSH comes back without
         # the caller having to handle this.
         state = self._dom_state(vm_id) or ""
         if state == "paused":
-            _run(["virsh", "resume", vm_id], check=False)
+            _run(self._virsh("resume", vm_id), check=False)
         elif state in ("shut off", "shutoff"):
-            _run(["virsh", "start", vm_id], check=False)
+            _run(self._virsh("start", vm_id), check=False)
         # Wait for SSH to come back before returning so the next exec() doesn't
         # spend its retry budget waiting for the network to settle.
         ip = self._vm_mgmt_ip.get(vm_id)
@@ -402,30 +433,34 @@ class LibvirtBackend:
     # --- bridges & interfaces ---
 
     def create_bridge(self, name: str) -> str:
-        log.info("create_bridge: %s", name)
+        log.info("create_bridge: %s (netns=%s)", name, self._netns_name)
         # Idempotent: ignore "exists" errors.
-        res = _run(["ip", "link", "add", "name", name, "type", "bridge"], check=False)
+        res = _run(self._ip("ip", "link", "add", "name", name, "type", "bridge"),
+                   check=False)
         if res.returncode != 0 and "exists" not in (res.stderr or ""):
             raise RuntimeError(f"ip link add failed: {res.stderr}")
-        _run(["ip", "link", "set", name, "up"])
+        _run(self._ip("ip", "link", "set", name, "up"))
         return name
 
     def delete_bridge(self, name: str) -> None:
-        log.info("delete_bridge: %s", name)
-        _run(["ip", "link", "set", name, "down"], check=False)
-        _run(["ip", "link", "delete", name], check=False)
+        log.info("delete_bridge: %s (netns=%s)", name, self._netns_name)
+        _run(self._ip("ip", "link", "set", name, "down"), check=False)
+        _run(self._ip("ip", "link", "delete", name), check=False)
 
     def assign_host_ip(self, bridge: str, ip: str, cidr: str) -> None:
-        log.info("assign_host_ip: %s -> %s/%s", bridge, ip, cidr)
-        res = _run(["ip", "addr", "add", f"{ip}/{cidr}", "dev", bridge], check=False)
+        log.info("assign_host_ip: %s -> %s/%s (netns=%s)",
+                 bridge, ip, cidr, self._netns_name)
+        res = _run(self._ip("ip", "addr", "add", f"{ip}/{cidr}", "dev", bridge),
+                   check=False)
         if res.returncode != 0 and "exists" not in (res.stderr or ""):
             raise RuntimeError(f"ip addr add failed: {res.stderr}")
-        # Block L3 forwarding between any two mgmt bridges so coexisting
-        # topologies stay isolated even when net.ipv4.ip_forward=1 is enabled
-        # for VM internet access via MASQUERADE. Intra-bridge L2 traffic isn't
-        # affected because it never traverses the FORWARD chain. See
+        # In netns mode, isolation is structural — separate network namespaces
+        # cannot leak between ranges — so the legacy FORWARD DROP rule is moot.
+        # Only install it in legacy host-level mode where all mgmt bridges
+        # share the host network stack. See
         # scratch/issues/20260529-3-mgmt-bridge-isolation-bug.md.
-        self._ensure_mgmt_isolation()
+        if self._netns_name is None:
+            self._ensure_mgmt_isolation()
 
     def _ensure_mgmt_isolation(self) -> None:
         rule = ["-i", "rlmgt+", "-o", "rlmgt+", "-j", "DROP"]
@@ -453,12 +488,12 @@ class LibvirtBackend:
             return
         log.info("attach_interface: enslaving tap=%s to bridge=%s "
                  "(vm=%s mac=%s)", tap, bridge, vm_id, mac)
-        _run(["ip", "link", "set", tap, "master", bridge], check=False)
-        _run(["ip", "link", "set", tap, "up"], check=False)
+        _run(self._ip("ip", "link", "set", tap, "master", bridge), check=False)
+        _run(self._ip("ip", "link", "set", tap, "up"), check=False)
 
     def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
         """Return the host TAP device name for the VM's NIC with the given MAC."""
-        res = _run(["virsh", "domiflist", vm_id], check=False)
+        res = _run(self._virsh("domiflist", vm_id), check=False)
         if res.returncode != 0:
             return None
         target = mac.lower()
