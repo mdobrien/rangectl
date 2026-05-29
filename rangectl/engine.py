@@ -414,12 +414,14 @@ class Engine:
         link._db = self._db
         link._topology_name = topology.name
 
-        # Call attach_interface for each side. LibvirtBackend treats this as a
-        # no-op (ifaces are in initial XML). Mock back-ends record the call,
-        # which the unit tests rely on.
+        # Call attach_interface for each side. LibvirtBackend uses this to
+        # ensure the VM's TAP is enslaved to the bridge (idempotent during
+        # initial deploy; load-bearing when Link.up() recreates the bridge).
+        # Mock back-ends record the call, which the unit tests rely on.
         for side in (link.if_a, link.if_b):
             vm_id = self._vm_ids[(topology.name, side.node_name)]
             mac = _mac_for(topology.name, side.node_name, side.interface_name)
+            link._endpoints.append((vm_id, mac))
             self._backend.attach_interface(vm_id, br, mac)
 
         for side in (link.if_a, link.if_b):

@@ -220,6 +220,10 @@ class Link:
         self._bridge_name: str | None = None
         self._db: Any = None
         self._topology_name: str | None = None
+        # Endpoints needed for Link.up() to re-enslave VM TAPs to the
+        # recreated bridge. Populated by Engine._wire_link as
+        # [(vm_id, mac), (vm_id, mac)].
+        self._endpoints: list[tuple[str, str]] = []
 
     def down(self) -> None:
         log.info("Link down: %s/%s <-> %s/%s",
@@ -240,6 +244,12 @@ class Link:
         if self._backend is None or self._bridge_name is None:
             raise RuntimeError("Link not wired to backend; deploy the topology first")
         self._backend.create_bridge(self._bridge_name)
+        # Re-enslave each VM's TAP to the newly recreated bridge. Deleting
+        # the bridge orphaned its slave TAPs; creating a fresh bridge with
+        # the same name does NOT auto-reattach them, so we must do it
+        # explicitly to restore connectivity.
+        for vm_id, mac in self._endpoints:
+            self._backend.attach_interface(vm_id, self._bridge_name, mac)
         self._is_up = True
         if self._db is not None and self._topology_name is not None:
             self._db.log_event(self._topology_name, None, "info",

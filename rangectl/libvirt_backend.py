@@ -422,11 +422,35 @@ class LibvirtBackend:
             raise RuntimeError(f"ip addr add failed: {res.stderr}")
 
     def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
-        # Interfaces are inlined into the domain XML at create_vm time, so this
-        # is a no-op in normal deploy. Implemented for Link.up() hot-reattach
-        # scenarios (future work).
-        log.debug("attach_interface (no-op, baked into XML): %s %s %s",
-                  vm_id, bridge, mac)
+        # Interfaces are inlined into the domain XML at create_vm time. On
+        # initial deploy libvirt has already enslaved the TAP to the bridge,
+        # so this call is a redundant no-op (re-enslaving the same master
+        # is harmless). After Link.down()/up(), however, the bridge was
+        # deleted and recreated — the TAP is now orphaned and must be
+        # re-enslaved manually for the link to carry traffic again.
+        tap = self._find_tap_for_mac(vm_id, mac)
+        if not tap:
+            log.debug("attach_interface: no TAP found for vm=%s mac=%s",
+                      vm_id, mac)
+            return
+        log.info("attach_interface: enslaving tap=%s to bridge=%s "
+                 "(vm=%s mac=%s)", tap, bridge, vm_id, mac)
+        _run(["ip", "link", "set", tap, "master", bridge], check=False)
+        _run(["ip", "link", "set", tap, "up"], check=False)
+
+    def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
+        """Return the host TAP device name for the VM's NIC with the given MAC."""
+        res = _run(["virsh", "domiflist", vm_id], check=False)
+        if res.returncode != 0:
+            return None
+        target = mac.lower()
+        for line in res.stdout.splitlines():
+            fields = line.split()
+            # virsh domiflist columns: Interface Type Source Model MAC
+            if len(fields) >= 5 and fields[-1].lower() == target:
+                tap = fields[0]
+                return tap if tap and tap != "-" else None
+        return None
 
     def create_overlay(self, base_image: str, overlay_path: str) -> str:
         log.info("create_overlay: %s -> %s", base_image, overlay_path)
