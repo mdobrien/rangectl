@@ -66,14 +66,27 @@ def _guest_iface_name(image_os_type: str, slot_index: int) -> str:
 class Engine:
     """Orchestrates topology deployment using the dependency DAG."""
 
-    def __init__(self, backend: Backend, db: StateDB) -> None:
+    def __init__(self, backend: Backend, db: StateDB,
+                 container_backend: Backend | None = None) -> None:
         self._backend = backend
+        self._container_backend = container_backend
         self._db = db
         # Per-deploy tracking — populated during deploy(), consumed in destroy().
         self._vm_ids: dict[tuple[str, str], str] = {}
         self._mgmt_ips: dict[tuple[str, str], str] = {}
         self._link_bridges: dict[str, list[str]] = {}
         self._lock = Lock()
+
+    def _backend_for(self, node: Node) -> Backend:
+        """Pick the backend for this node based on type (image vs container)."""
+        if node.is_container:
+            if self._container_backend is None:
+                raise RuntimeError(
+                    f"node {node.name!r} is a container but no container_backend "
+                    "was passed to Engine()"
+                )
+            return self._container_backend
+        return self._backend
 
     def validate_resources(self, topology: Topology) -> None:
         log.info("Validating host resources for topology '%s'", topology.name)
@@ -206,7 +219,7 @@ class Engine:
                 name=node.name,
                 mgmt_ip=mgmt_ip,
                 topology_name=topology.name,
-                backend=self._backend,
+                backend=self._backend_for(node),
                 vm_id=self._vm_ids[(topology.name, node.name)],
                 db=self._db,
             )
@@ -278,18 +291,27 @@ class Engine:
     def _deploy_node(self, topology: Topology, node: Node,
                      mgmt_subnet: str, mgmt_bridge: str,
                      ssh_pubkey: str, host_ip: str) -> None:
-        log.info("[%s/%s] Provisioning", topology.name, node.name)
+        log.info("[%s/%s] Provisioning (%s)", topology.name, node.name,
+                 "container" if node.is_container else "vm")
         node.state = transition_node_state(node.state, NodeState.PROVISIONING)
+        backend = self._backend_for(node)
+        # `image` column persists either the VM image or the container image
+        # — both are the user-facing source of the node's runtime.
+        image_or_container = node.container if node.is_container else node.image
         self._db.save_node(
             topology_name=topology.name,
             name=node.name,
-            image=node.image,
+            image=image_or_container,
             vcpu=node.vcpu,
             memory_mb=node.memory,
             os_type=node.os_type.value,
             state=node.state.value,
         )
         self._db.log_event(topology.name, node.name, "info", "provisioning")
+
+        if node.is_container:
+            self._deploy_container_node(topology, node, mgmt_bridge, host_ip)
+            return
 
         # Resolve image — in unit tests the image name is opaque; just pass through.
         image_record = self._db.get_image(node.image)
@@ -393,6 +415,51 @@ class Engine:
         self._db.log_event(topology.name, node.name, "info",
                            f"ready, mgmt_ip={mgmt_ip}")
 
+    def _deploy_container_node(self, topology: Topology, node: Node,
+                                mgmt_bridge: str, host_ip: str) -> None:
+        """Provision a Docker container node and wire its mgmt interface."""
+        cb = self._container_backend
+        assert cb is not None  # _backend_for() would have raised otherwise.
+
+        ifaces = self._build_interface_specs(topology, node, mgmt_bridge)
+        mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
+
+        spec = VMSpec(
+            name=f"{topology.name}-{node.name}",
+            image=node.container,  # the docker image string
+            vcpu=node.vcpu,
+            memory=node.memory,
+            os_type=node.os_type,
+            interfaces=ifaces,
+            overlay_path=None,
+            seed_iso_path=None,
+            mgmt_ip=mgmt_ip,
+            topology_name=topology.name,
+        )
+        vm_id = cb.create_vm(spec)
+        with self._lock:
+            self._vm_ids[(topology.name, node.name)] = vm_id
+
+        cb.start(vm_id)
+        # Container is now running with --network=none; wire mgmt veth.
+        cb.attach_interface(vm_id, mgmt_bridge,
+                            _mac_for(topology.name, node.name, "mgmt"))
+
+        self._db.save_node(
+            topology_name=topology.name,
+            name=node.name,
+            image=node.container,
+            vcpu=node.vcpu,
+            memory_mb=node.memory,
+            os_type=node.os_type.value,
+            state=node.state.value,
+            mgmt_ip=mgmt_ip,
+        )
+        node.state = transition_node_state(node.state, NodeState.READY)
+        self._db.update_node_state(topology.name, node.name, node.state.value)
+        self._db.log_event(topology.name, node.name, "info",
+                           f"ready (container), mgmt_ip={mgmt_ip}")
+
     def _wire_link(self, topology: Topology, link, link_index: int) -> None:
         br = bridge_name(topology.name, link_index)
         log.info("[%s] Wiring link %d: %s/%s <-> %s/%s via %s",
@@ -417,12 +484,14 @@ class Engine:
         # Call attach_interface for each side. LibvirtBackend uses this to
         # ensure the VM's TAP is enslaved to the bridge (idempotent during
         # initial deploy; load-bearing when Link.up() recreates the bridge).
+        # ContainerBackend uses this to create+wire the veth pair.
         # Mock back-ends record the call, which the unit tests rely on.
         for side in (link.if_a, link.if_b):
             vm_id = self._vm_ids[(topology.name, side.node_name)]
             mac = _mac_for(topology.name, side.node_name, side.interface_name)
             link._endpoints.append((vm_id, mac))
-            self._backend.attach_interface(vm_id, br, mac)
+            side_node = topology._nodes[side.node_name]
+            self._backend_for(side_node).attach_interface(vm_id, br, mac)
 
         for side in (link.if_a, link.if_b):
             node = topology._nodes[side.node_name]
@@ -439,11 +508,12 @@ class Engine:
 
         vm_id = self._vm_ids[(topology.name, node.name)]
         mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
+        backend = self._backend_for(node)
         live = LiveNode(
             name=node.name,
             mgmt_ip=mgmt_ip,
             topology_name=topology.name,
-            backend=self._backend,
+            backend=backend,
             vm_id=vm_id,
         )
 
@@ -454,8 +524,8 @@ class Engine:
             # service ops always need sudo. Wait for any cloud-init apt lock
             # to release first, otherwise install races with first-boot
             # `unattended-upgrades`.
-            self._backend.exec(vm_id, "cloud-init status --wait || true")
-            r = self._backend.exec(
+            backend.exec(vm_id, "cloud-init status --wait || true")
+            r = backend.exec(
                 vm_id,
                 f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_list}",
             )
@@ -466,19 +536,19 @@ class Engine:
                     f"apt-get install failed for {node.name}: {r.stderr.strip()[:300]}"
                 )
         for ps_cmd in node._powershell_commands:
-            self._backend.exec(vm_id, f"powershell -Command {ps_cmd}")
+            backend.exec(vm_id, f"powershell -Command {ps_cmd}")
 
         # 2. files — upload each registered file.
         for dst, src in node._files:
-            self._backend.upload(vm_id, src, dst)
+            backend.upload(vm_id, src, dst)
 
         # 3. installs — upload source, run install, optionally verify.
         for inst in node._installs:
             remote_src = f"/tmp/{Path(inst.src).name}"
-            self._backend.upload(vm_id, inst.src, remote_src)
-            self._backend.exec(vm_id, inst.install_cmd)
+            backend.upload(vm_id, inst.src, remote_src)
+            backend.exec(vm_id, inst.install_cmd)
             if inst.verify_cmd:
-                self._backend.exec(vm_id, inst.verify_cmd)
+                backend.exec(vm_id, inst.verify_cmd)
 
         # 4. configure functions — pass a LiveNode bound to the backend.
         for fn in node._configure_fns:
@@ -489,9 +559,9 @@ class Engine:
         # Linux services list, so no Windows-side branch needed here.
         for svc in node._services:
             if svc.enabled:
-                self._backend.exec(vm_id, f"sudo systemctl enable {svc.name}")
+                backend.exec(vm_id, f"sudo systemctl enable {svc.name}")
             start_cmd = svc.start_cmd or f"sudo systemctl start {svc.name}"
-            self._backend.exec(vm_id, start_cmd)
+            backend.exec(vm_id, start_cmd)
 
         if node.state == NodeState.LINKED:
             node.state = transition_node_state(node.state, NodeState.RUNNING)
@@ -511,8 +581,9 @@ class Engine:
             except Exception:
                 node.state = NodeState.DESTROYING
             self._db.update_node_state(topology.name, node.name, node.state.value)
-            self._backend.stop(vm_id)
-            self._backend.destroy(vm_id)
+            node_backend = self._backend_for(node)
+            node_backend.stop(vm_id)
+            node_backend.destroy(vm_id)
             node.state = transition_node_state(node.state, NodeState.DESTROYED)
             self._db.update_node_state(topology.name, node.name, node.state.value)
             self._vm_ids.pop((topology.name, node.name), None)

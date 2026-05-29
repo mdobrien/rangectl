@@ -83,6 +83,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 | 3 | State Machine + DAG | `20260527-8-phase3-state-machine-dag.md` | Gate 1 DONE | 64/64 | Topo 2 ✅ | |
 | 4-5 | Images + Dependencies | `20260527-9-phase4-5-images-dependencies.md` | Gate 1 DONE | 91/91 | Topo 3 ⏳ | Blocked: VM internet |
 | 6 | SDK Surface | `20260527-10-phase6-sdk-surface.md` | Gate 1 DONE | 117/117 | Topo 4-6 pending | |
+| 7 | Docker container nodes | `20260529-4-phase7-docker-container-nodes.md` | COMPLETE | 138/138 | Topo 7 ✅ | Mixed VM+container topologies |
 
 ## Gate 2 Integration Test Status
 | Topo | Description | Status | Commit | Notes |
@@ -93,6 +94,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 | 4 | Diamond DAG + snapshot | ✅ PASS (155s) | bfc3180 | All Ubuntu; restore() now resumes paused/shut-off domains |
 | 5 | Link toggle | ✅ PASS (94s) | 87f45c0 | Required SDK fix: TAP re-enslave on Link.up() |
 | 6 | Multi-topology isolation | ✅ PASS (155s) | 36c7949 | Required SDK fix: FORWARD DROP between rlmgt+ bridges (issue 20260529-3) |
+| 7 | Mixed VM + Docker container | ✅ PASS (50s) | uncommitted | nginx container + Ubuntu VM on shared bridge; ping + curl confirmed |
 
 ## Progress Log
 

@@ -23,11 +23,13 @@ class Topology:
         name: str,
         backend: Any = None,
         db: Any = None,
+        container_backend: Any = None,
     ) -> None:
         self.name = name
         self._nodes: dict[str, Node] = {}
         self._links: list[Link] = []
         self._backend = backend
+        self._container_backend = container_backend
         self._db = db
         self._engine = None
         log.info("Topology '%s' created", name)
@@ -35,14 +37,22 @@ class Topology:
     def node(
         self,
         name: str,
-        image: str,
+        image: str | None = None,
         vcpu: int = 1,
         memory: int = 1024,
         os: OSType | str = OSType.LINUX,
         depends_on: list[Node] | None = None,
         ready_when: ReadinessProbe | None = None,
+        container: str | None = None,
     ) -> Node:
-        log.info("Declaring node '%s' (image=%s, vcpu=%d, memory=%dMB)", name, image, vcpu, memory)
+        if (image is None) == (container is None):
+            raise ValueError(
+                f"node '{name}': exactly one of image= or container= must be set"
+            )
+        log.info("Declaring node '%s' (%s, vcpu=%d, memory=%dMB)",
+                 name,
+                 f"image={image}" if image else f"container={container}",
+                 vcpu, memory)
         node = Node(
             name=name,
             topology=self,
@@ -52,6 +62,7 @@ class Topology:
             os_type=OSType(os) if isinstance(os, str) else os,
             depends_on=depends_on or [],
             ready_when=ready_when,
+            container=container,
         )
         self._nodes[name] = node
         return node
@@ -78,7 +89,8 @@ class Topology:
                 "Topology.deploy() requires backend and db. "
                 "Pass them to Topology(name, backend=..., db=...) or use Engine directly."
             )
-        self._engine = Engine(self._backend, self._db)
+        self._engine = Engine(self._backend, self._db,
+                              container_backend=self._container_backend)
         rng = self._engine.deploy(self, cleanup_on_fail=cleanup_on_fail)
         rng._engine = self._engine
         rng._db = self._db
@@ -95,6 +107,7 @@ class Topology:
             node_data = {
                 "name": node.name,
                 "image": node.image,
+                "container": node.container,
                 "vcpu": node.vcpu,
                 "memory": node.memory,
                 "os": node.os_type.value,
@@ -128,7 +141,8 @@ class Topology:
         for nd in data.get("nodes", []):
             node = topo.node(
                 nd["name"],
-                nd["image"],
+                image=nd.get("image"),
+                container=nd.get("container"),
                 vcpu=nd.get("vcpu", 1),
                 memory=nd.get("memory", 1024),
                 os=nd.get("os", "linux"),
@@ -173,17 +187,19 @@ class Node(DependencyMixin):
         self,
         name: str,
         topology: Topology,
-        image: str,
+        image: str | None,
         vcpu: int,
         memory: int,
         os_type: OSType,
         depends_on: list[Node],
         ready_when: ReadinessProbe | None,
+        container: str | None = None,
     ) -> None:
         super().__init__()
         self.name = name
         self.topology = topology
         self.image = image
+        self.container = container
         self.vcpu = vcpu
         self.memory = memory
         self.os_type = os_type
@@ -191,6 +207,10 @@ class Node(DependencyMixin):
         self.ready_when = ready_when
         self.state = NodeState.DEFINED
         self._interfaces: dict[str, InterfaceSpec] = {}
+
+    @property
+    def is_container(self) -> bool:
+        return self.container is not None
 
     def __getattr__(self, name: str) -> InterfaceSpec:
         if name.startswith("eth"):
