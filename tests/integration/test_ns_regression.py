@@ -305,6 +305,12 @@ def test_ns_freeze_thaw(backend: LibvirtBackend, db: StateDB):
         assert resumed, "VM a never resumed responding after thaw"
         assert freeze_state.read_text().strip() == "0"
     finally:
+        # Always thaw before destroy: a frozen libvirtd can't process the
+        # stop/destroy calls, so a mid-test failure would otherwise wedge here.
+        try:
+            rng.thaw()
+        except Exception:
+            pass
         engine.destroy(t)
     assert not _netns_exists("rangectl-nsfreeze")
 
@@ -317,15 +323,19 @@ def test_ns_internet_none_blocks_outbound(backend: LibvirtBackend, db: StateDB):
     b = t.node("b", image="ubuntu-22.04", vcpu=1, memory=1024)
     t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
-    with _without_blanket_nat():
-        engine = Engine(backend, db, use_namespaces=True)  # internet defaults none
-        rng = engine.deploy(t)
-        try:
+    # Deploy with the blanket NAT in place so cloud-init has internet and the
+    # VM boots quickly/reliably; internet="none" adds no per-range NAT. Only
+    # for the blockage assertion do we drop the blanket rule — then there is NO
+    # NAT for this subnet, so internet=none genuinely blocks outbound.
+    engine = Engine(backend, db, use_namespaces=True)  # internet defaults none
+    rng = engine.deploy(t)
+    try:
+        with _without_blanket_nat():
             out = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
             assert out.exit_code != 0, (
                 f"internet=none should block outbound, but ping succeeded:\n{out.stdout}")
-        finally:
-            engine.destroy(t)
+    finally:
+        engine.destroy(t)
 
 
 def test_ns_internet_full_allows_outbound(backend: LibvirtBackend, db: StateDB):
@@ -360,10 +370,12 @@ def test_ns_internet_runtime_toggle(backend: LibvirtBackend, db: StateDB):
     b = t.node("b", image="ubuntu-22.04", vcpu=1, memory=1024)
     t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
-    with _without_blanket_nat():
-        engine = Engine(backend, db, use_namespaces=True)
-        rng = engine.deploy(t)
-        try:
+    # Boot with the blanket NAT present (fast/reliable); then drop it for the
+    # toggle assertions so ONLY the per-range chain controls outbound.
+    engine = Engine(backend, db, use_namespaces=True)
+    rng = engine.deploy(t)
+    try:
+        with _without_blanket_nat():
             assert rng["a"].exec("ping -c 2 -W 3 8.8.8.8").exit_code != 0, (
                 "outbound should be blocked before enable_internet()")
 
@@ -383,8 +395,8 @@ def test_ns_internet_runtime_toggle(backend: LibvirtBackend, db: StateDB):
             closed = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
             assert closed.exit_code != 0, (
                 f"disable_internet() did not close outbound:\n{closed.stdout}")
-        finally:
-            engine.destroy(t)
+    finally:
+        engine.destroy(t)
 
 
 # --- Resource limits --------------------------------------------------------
