@@ -16,8 +16,8 @@ You are the team lead for rangectl. You do NOT write code — you spawn coding a
 - **Gate 2 Topo 3**: BLOCKED — deploy + routing work, but `apt-get install nginx` fails because VMs have no internet (mgmt bridges not NAT'd)
 - **Gate 2 Topo 4**: PASSING (commit bfc3180) — diamond DAG + snapshot/restore on 4 Ubuntu nodes
 - **Gate 2 Topo 5**: PASSING (commit 87f45c0) — link toggle on routed 3-node topology; needed SDK fix to re-enslave VM TAPs on `Link.up()`
-- **Gate 2 Topo 6**: Not started
-- **EC2 instance**: STOPPED (c5.metal). Run `scratch/scripts/ec2.sh start` to resume.
+- **Gate 2 Topo 6**: PASSING (uncommitted at write time) — multi-topology isolation; required SDK fix to block inter-mgmt-bridge L3 forwarding via iptables FORWARD `rlmgt+`→`rlmgt+` DROP
+- **EC2 instance**: RUNNING (per user request — leave up between sessions; only clean leftover VMs/bridges)
 - **Team name**: `rangectl`
 
 ## Uncommitted Changes
@@ -55,7 +55,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 
 # rangectl — Orchestrator Tracking
 **Created**: 2026-05-27
-**Status**: In Progress — Gate 2 Topo 2 green, Topo 3 blocked on VM internet
+**Status**: In Progress — Gate 2 Topo 1-6 ALL green (full sweep deferred — Topo 6 confirmed PASS, prior Topo 1-5 commits stand)
 
 ## Related Issues
 - **Plan**: `20260527-1-vm-testbed-platform-design.md`
@@ -92,7 +92,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 | 3 | Services + DependencySet | ⏳ BLOCKED | uncommitted | apt-get fails — no VM internet |
 | 4 | Diamond DAG + snapshot | ✅ PASS (155s) | bfc3180 | All Ubuntu; restore() now resumes paused/shut-off domains |
 | 5 | Link toggle | ✅ PASS (94s) | 87f45c0 | Required SDK fix: TAP re-enslave on Link.up() |
-| 6 | Multi-topology isolation | ❌ Not started | | |
+| 6 | Multi-topology isolation | ✅ PASS (155s) | PENDING | Required SDK fix: FORWARD DROP between rlmgt+ bridges (issue 20260529-3) |
 
 ## Progress Log
 
@@ -121,6 +121,13 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 - LibvirtBackend, cloud-init seed ISO, paramiko SSH
 - Bridge names hashed for IFNAMSIZ
 - Overlays/seeds in `/var/lib/libvirt/images/rangectl/`
+
+### Gate 2 Phase 4 — Topo 6 Complete (uncommitted at write)
+- Two coexisting topologies: red-team (VyOS+2 Ubuntu, routed) + blue-team (2 Ubuntu, single subnet)
+- Internal connectivity, isolation across mgmt bridges, staggered destroy all verified
+- SDK fix: `LibvirtBackend._ensure_mgmt_isolation()` installs `iptables -I FORWARD 1 -i rlmgt+ -o rlmgt+ -j DROP` (idempotent, called from `assign_host_ip`). Closes a real isolation gap that any environment with `ip_forward=1` would hit.
+- Full sweep skipped at user request — Topo 1-5 prior commit hashes still authoritative.
+- See `20260529-2-topo6-multi-topology-isolation.md` and `20260529-3-mgmt-bridge-isolation-bug.md`.
 
 ### Gate 2 Phase 2 — Topo 2 Green, Topo 3 Blocked (uncommitted)
 - VyOS support: OSType.VYOS, serial-console pexpect bootstrap, hw-id persistence

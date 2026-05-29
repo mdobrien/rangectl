@@ -420,6 +420,24 @@ class LibvirtBackend:
         res = _run(["ip", "addr", "add", f"{ip}/{cidr}", "dev", bridge], check=False)
         if res.returncode != 0 and "exists" not in (res.stderr or ""):
             raise RuntimeError(f"ip addr add failed: {res.stderr}")
+        # Block L3 forwarding between any two mgmt bridges so coexisting
+        # topologies stay isolated even when net.ipv4.ip_forward=1 is enabled
+        # for VM internet access via MASQUERADE. Intra-bridge L2 traffic isn't
+        # affected because it never traverses the FORWARD chain. See
+        # scratch/issues/20260529-3-mgmt-bridge-isolation-bug.md.
+        self._ensure_mgmt_isolation()
+
+    def _ensure_mgmt_isolation(self) -> None:
+        rule = ["-i", "rlmgt+", "-o", "rlmgt+", "-j", "DROP"]
+        check = _run(["iptables", "-C", "FORWARD", *rule], check=False)
+        if check.returncode == 0:
+            return
+        log.info("Installing mgmt-bridge isolation rule: FORWARD %s",
+                 " ".join(rule))
+        ins = _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
+        if ins.returncode != 0:
+            log.warning("Failed to install mgmt isolation rule: %s",
+                        ins.stderr)
 
     def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
         # Interfaces are inlined into the domain XML at create_vm time. On
