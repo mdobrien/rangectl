@@ -384,6 +384,20 @@ class LibvirtBackend:
     def restore(self, vm_id: str, snapshot_id: str) -> None:
         log.info("restore: %s @ %s", vm_id, snapshot_id)
         _run(["virsh", "snapshot-revert", vm_id, snapshot_id])
+        # snapshot-revert can leave the domain in a non-running state depending
+        # on how the snapshot was created (disk-only -> shut off; some kernels
+        # -> paused). Force the VM back to running so SSH comes back without
+        # the caller having to handle this.
+        state = self._dom_state(vm_id) or ""
+        if state == "paused":
+            _run(["virsh", "resume", vm_id], check=False)
+        elif state in ("shut off", "shutoff"):
+            _run(["virsh", "start", vm_id], check=False)
+        # Wait for SSH to come back before returning so the next exec() doesn't
+        # spend its retry budget waiting for the network to settle.
+        ip = self._vm_mgmt_ip.get(vm_id)
+        if ip:
+            self._wait_for_ssh(ip)
 
     # --- bridges & interfaces ---
 
