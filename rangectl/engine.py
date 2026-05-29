@@ -200,6 +200,61 @@ class Engine:
         return None
 
     def deploy(self, topology: Topology, cleanup_on_fail: bool = True) -> Range:
+        """Deploy ``topology``. On any failure, if ``cleanup_on_fail`` (the
+        default), best-effort tear down whatever was partially created — VMs,
+        the range namespace + libvirtd, bridges, DB rows — so nothing leaks,
+        then re-raise the original error."""
+        try:
+            return self._deploy_impl(topology)
+        except BaseException:
+            if cleanup_on_fail:
+                self._cleanup_failed_deploy(topology)
+            raise
+
+    def _cleanup_failed_deploy(self, topology: Topology) -> None:
+        """Best-effort teardown of a partially-deployed topology. Mirrors
+        ``destroy()`` but tolerates partial state. VMs are force-destroyed
+        (``--remove-all-storage``, so overlays don't leak) BEFORE the namespace
+        teardown, because ``destroy_range`` kills the per-range libvirtd the
+        destroy call needs to reach."""
+        log.warning("Deploy of '%s' failed; cleaning up partial state",
+                    topology.name)
+        for node in topology._nodes.values():
+            vm_id = self._vm_ids.get((topology.name, node.name))
+            if vm_id is None:
+                continue
+            try:
+                self._backend_for(topology.name, node).destroy(vm_id)
+            except Exception as exc:
+                log.warning("cleanup: destroy VM %s failed: %s", vm_id, exc)
+            self._vm_ids.pop((topology.name, node.name), None)
+
+        if self._use_namespaces:
+            try:
+                self._teardown_namespace(topology.name)
+            except Exception as exc:
+                log.warning("cleanup: namespace teardown for %s failed: %s",
+                            topology.name, exc)
+        else:
+            for br in self._link_bridges.get(topology.name, []):
+                try:
+                    self._backend.delete_bridge(br)
+                except Exception as exc:
+                    log.warning("cleanup: delete bridge %s failed: %s", br, exc)
+            try:
+                self._backend.delete_bridge(mgmt_bridge_name(topology.name))
+            except Exception as exc:
+                log.warning("cleanup: delete mgmt bridge failed: %s", exc)
+        self._link_bridges.pop(topology.name, None)
+
+        for label, fn in (("free_mgmt_subnet", self._db.free_mgmt_subnet),
+                          ("delete_topology", self._db.delete_topology)):
+            try:
+                fn(topology.name)
+            except Exception as exc:
+                log.warning("cleanup: %s failed: %s", label, exc)
+
+    def _deploy_impl(self, topology: Topology) -> Range:
         log.info("Engine deploying topology '%s'", topology.name)
 
         # Reset per-deploy bookkeeping for this topology.

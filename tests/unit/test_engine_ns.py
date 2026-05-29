@@ -179,6 +179,46 @@ def test_destroy_does_not_delete_bridges_directly(backend, db, ns):
     assert ns.range_backend.calls_of("delete_bridge") == []
 
 
+# --- cleanup_on_fail -------------------------------------------------------
+
+def test_deploy_cleanup_on_fail_tears_down_range(backend, db, ns, monkeypatch):
+    """A mid-wave deploy failure (e.g. node SSH never comes up) must tear the
+    range down — destroy the started VMs and the per-range libvirtd/netns — so
+    nothing leaks. Regression for the cleanup_on_fail gap."""
+    engine = Engine(backend, db, use_namespaces=True)
+    topo = _two_node_link_topo()
+
+    def boom(vm_id):
+        ns.range_backend._record("start", vm_id)
+        raise RuntimeError("SSH not reachable on 192.168.100.2 after 240s: timed out")
+    monkeypatch.setattr(ns.range_backend, "start", boom)
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        engine.deploy(topo)
+
+    # Per-range libvirtd/netns torn down (destroy_range called for this topo).
+    assert ns.destroyed == ["nsr"]
+    # VMs that were created get force-destroyed (overlay storage removed).
+    assert len(ns.range_backend.calls_of("destroy")) >= 1
+    # mgmt subnet freed + topology row removed.
+    assert db.get_topology("nsr") is None
+
+
+def test_deploy_cleanup_on_fail_false_leaves_state(backend, db, ns, monkeypatch):
+    """With cleanup_on_fail=False the engine must NOT tear down on failure."""
+    engine = Engine(backend, db, use_namespaces=True)
+    topo = _two_node_link_topo()
+
+    def boom(vm_id):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(ns.range_backend, "start", boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        engine.deploy(topo, cleanup_on_fail=False)
+
+    assert ns.destroyed == []
+
+
 # --- cgroup integration ----------------------------------------------------
 
 def test_deploy_with_resources_creates_cgroup_and_writes_pid(backend, db, ns):
