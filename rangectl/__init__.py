@@ -1,4 +1,5 @@
 from rangectl.topology import Range, Link, LiveNode, Node, Topology
+from rangectl.cgroup import Resources
 from rangectl.dependencies import DependencySet
 from rangectl.images import ImageBuilder, ImageRegistry
 from rangectl.readiness import command_succeeds, ping, port_open, process_running
@@ -11,6 +12,7 @@ __all__ = [
     "Link",
     "Range",
     "LiveNode",
+    "Resources",
     "DependencySet",
     "ImageBuilder",
     "ImageRegistry",

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from threading import Lock, Thread
 
-from rangectl import cgroup, supervisor
+from rangectl import cgroup, internet, supervisor
 from rangectl.backend import Backend
 from rangectl.cgroup import Resources
 from rangectl.cloudinit import create_seed_iso
@@ -74,7 +74,8 @@ class Engine:
     def __init__(self, backend: Backend, db: StateDB,
                  container_backend: Backend | None = None,
                  use_namespaces: bool = False,
-                 resources: Resources | None = None) -> None:
+                 resources: Resources | None = None,
+                 internet: str = "none") -> None:
         self._backend = backend
         self._container_backend = container_backend
         self._db = db
@@ -84,6 +85,10 @@ class Engine:
         # False the engine behaves exactly as the legacy host-level deploy.
         self._use_namespaces = use_namespaces
         self._resources = resources
+        # Outbound-internet policy for the range: "none" (default, isolated) or
+        # "full" (MASQUERADE out the host uplink). Only applied in ns mode,
+        # where the range's host-side veth is the single choke point.
+        self._internet = internet
         # Per-deploy tracking — populated during deploy(), consumed in destroy().
         self._vm_ids: dict[tuple[str, str], str] = {}
         self._mgmt_ips: dict[tuple[str, str], str] = {}
@@ -284,7 +289,7 @@ class Engine:
         )
         self._db.log_event(topology.name, None, "info", "deployment complete")
 
-        rng = Range(topology)
+        rng = Range(topology, internet=self._internet, resources=self._resources)
         for node in topology._nodes.values():
             mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
             rng._nodes[node.name] = LiveNode(
@@ -298,6 +303,12 @@ class Engine:
         rng._engine = self
         rng._db = self._db
         rng._backend = vm_backend
+        # In ns mode, give the live Range the veth + subnet so its runtime
+        # freeze/thaw and internet controls can act on the right range.
+        if self._use_namespaces:
+            info = self._range_info[topology.name]
+            rng._mgmt_subnet = info.mgmt_subnet
+            rng._veth_host = info.veth_host
         log.info("Deployment complete")
         return rng
 
@@ -309,7 +320,11 @@ class Engine:
             cgroup_path = cgroup.create_cgroup(topology_name, self._resources)
             self._cgroup_paths[topology_name] = cgroup_path
 
-        info = supervisor.create_range(topology_name, mgmt_subnet)
+        # Pass the cgroup path so libvirtd self-places into it before exec —
+        # this is what actually puts QEMU under the freezer / resource limits
+        # (moving the wrapper PID alone leaves libvirtd in the launcher's cgroup).
+        info = supervisor.create_range(topology_name, mgmt_subnet,
+                                       cgroup_path=cgroup_path)
         self._range_info[topology_name] = info
         self._range_backends[topology_name] = self._make_range_backend(info)
         if self._container_backend is not None:
@@ -320,6 +335,11 @@ class Engine:
         # Place libvirtd (and thus every QEMU child it spawns) into the cgroup.
         if cgroup_path is not None:
             cgroup.write_pid(cgroup_path, info.pid)
+
+        # Apply the initial internet policy. The veth pair is the choke point,
+        # so MASQUERADE-ing its traffic gives the whole range outbound access.
+        if self._internet == "full":
+            internet.enable_internet(topology_name, mgmt_subnet, info.veth_host)
 
     def _deploy_wave(self, topology: Topology, wave: list[Node],
                      mgmt_subnet: str, mgmt_bridge: str,
@@ -699,6 +719,12 @@ class Engine:
     def _teardown_namespace(self, topology_name: str) -> None:
         """Tear down the range's namespaces + per-range libvirtd, then its
         cgroup (if one was created)."""
+        # Remove the range's internet rules first, while we still have its
+        # veth/subnet (destroy_range deletes the netns + veth afterwards).
+        info = self._range_info.get(topology_name)
+        if info is not None and self._internet == "full":
+            internet.disable_internet(topology_name, info.mgmt_subnet,
+                                      info.veth_host)
         supervisor.destroy_range(topology_name)
         self._range_info.pop(topology_name, None)
         self._range_backends.pop(topology_name, None)

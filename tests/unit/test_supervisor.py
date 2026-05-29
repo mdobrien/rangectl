@@ -139,6 +139,37 @@ def test_create_range_bind_mounts_and_blocks_dbus(created):
     assert "/var/lib/libvirt/images" not in script
 
 
+def test_create_range_no_cgroup_placement_by_default(created):
+    """Without a cgroup_path, no cgroup placement is attempted."""
+    _, ctx = created
+    # _place_in_cgroup is only called when a cgroup_path is given; the default
+    # `created` fixture passes none, so nothing referencing cgroup.procs runs.
+    script = ctx["popen"].call_args.args[0][-1]
+    assert "cgroup.procs" not in script
+
+
+def test_create_range_places_libvirtd_child_in_cgroup(tmp_path, fake_mgmt, monkeypatch):
+    """With a cgroup_path, libvirtd's forked child is written into cgroup.procs
+    from the host namespace (so QEMU inherits the freezer/limits)."""
+    cg = tmp_path / "cg"
+    cg.mkdir()
+    (cg / "cgroup.procs").write_text("")
+    proc = MagicMock()
+    proc.pid = 9999
+    # Simulate the wrapper having forked libvirtd as host PID 12345.
+    monkeypatch.setattr(supervisor, "_child_pids",
+                        lambda pid: [12345] if pid == 9999 else [])
+    with patch("rangectl.supervisor._run") as run, \
+         patch("rangectl.supervisor.subprocess.Popen", return_value=proc), \
+         patch("rangectl.supervisor.netns.create_mgmt_network",
+               return_value=fake_mgmt):
+        run.return_value = _ok()
+        supervisor.create_range("lab1", "10.255.1.0/24",
+                                range_dir=str(tmp_path / "r"),
+                                cgroup_path=str(cg))
+    assert (cg / "cgroup.procs").read_text() == "12345"
+
+
 def test_create_range_persists_state_file(created):
     info, ctx = created
     state = json.loads(

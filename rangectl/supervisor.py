@@ -32,6 +32,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_RANGE_DIR = "/ranges"
 TERM_GRACE_SECONDS = 5
+CGROUP_PLACE_TIMEOUT = 10  # seconds to wait for libvirtd to fork before giving up
 
 # Per-range dir -> libvirt state path. The shared image registry
 # (/var/lib/libvirt/images) is deliberately absent: every range reads base
@@ -107,11 +108,54 @@ def _launch_script(range_path: Path) -> str:
     return "; ".join(lines)
 
 
+def _child_pids(pid: int) -> list[int]:
+    """Direct children of ``pid`` (host PIDs), via /proc/<pid>/task/<pid>/children."""
+    try:
+        data = Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except OSError:
+        return []
+    return [int(x) for x in data.split()]
+
+
+def _place_in_cgroup(wrapper_pid: int, cgroup_path: str,
+                     timeout: float = CGROUP_PLACE_TIMEOUT) -> None:
+    """Move the libvirtd the wrapper forked into the range cgroup.
+
+    This MUST run in the host namespace: ``ip netns exec`` gives the launch
+    script a fresh ``/sys`` that shadows the cgroup2 mount, so libvirtd cannot
+    place itself. ``unshare --fork`` makes libvirtd a direct child of the
+    wrapper PID; we poll for it, then write it to ``cgroup.procs``. Every QEMU
+    libvirtd later spawns inherits this cgroup (libvirt doesn't relocate them
+    with dbus blocked), so the freezer + resource limits cover the whole tree.
+    """
+    procs = Path(cgroup_path) / "cgroup.procs"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        children = _child_pids(wrapper_pid)
+        if children:
+            for pid in children:
+                try:
+                    procs.write_text(str(pid))
+                except OSError as exc:
+                    log.warning("cgroup placement of pid %s failed: %s", pid, exc)
+            return
+        time.sleep(0.2)
+    log.warning("no libvirtd child of %s within %ss; cgroup limits not applied",
+                wrapper_pid, timeout)
+
+
 def create_range(name: str, mgmt_subnet: str,
-                 range_dir: str = DEFAULT_RANGE_DIR) -> RangeInfo:
+                 range_dir: str = DEFAULT_RANGE_DIR,
+                 cgroup_path: str | None = None) -> RangeInfo:
     """Provision a range: directories, configs, named netns + mgmt network, and
-    a libvirtd launched inside PID/mount/UTS namespaces."""
-    log.info("create_range: %s subnet=%s dir=%s", name, mgmt_subnet, range_dir)
+    a libvirtd launched inside PID/mount/UTS namespaces.
+
+    When ``cgroup_path`` is given, libvirtd self-places into that cgroup before
+    exec, so it (and all QEMU children) are subject to the range's freezer and
+    resource limits.
+    """
+    log.info("create_range: %s subnet=%s dir=%s cgroup=%s",
+             name, mgmt_subnet, range_dir, cgroup_path)
     range_path = Path(range_dir) / name
     netns_name = f"rangectl-{name}"
 
@@ -129,6 +173,12 @@ def create_range(name: str, mgmt_subnet: str,
         "/bin/bash", "-c", _launch_script(range_path),
     ]
     proc = subprocess.Popen(cmd)
+
+    # Place libvirtd into the range cgroup from the host namespace (it can't do
+    # so itself — see _place_in_cgroup). Must happen before any VM starts so
+    # QEMU children inherit the cgroup.
+    if cgroup_path is not None:
+        _place_in_cgroup(proc.pid, cgroup_path)
 
     socket_path = str(range_path / "run-libvirt" / "libvirt-sock")
     info = RangeInfo(

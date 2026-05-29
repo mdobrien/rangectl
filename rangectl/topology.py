@@ -80,17 +80,25 @@ class Topology:
         self._links.append(lnk)
         return lnk
 
-    def deploy(self, cleanup_on_fail: bool = True) -> Range:
+    def deploy(self, cleanup_on_fail: bool = True,
+               use_namespaces: bool = False,
+               resources: Any = None,
+               internet: str = "none") -> Range:
         from rangectl.engine import Engine
-        log.info("Deploying topology '%s' (%d nodes, %d links, cleanup_on_fail=%s)",
-                 self.name, len(self._nodes), len(self._links), cleanup_on_fail)
+        log.info("Deploying topology '%s' (%d nodes, %d links, cleanup_on_fail=%s, "
+                 "use_namespaces=%s, internet=%s)",
+                 self.name, len(self._nodes), len(self._links), cleanup_on_fail,
+                 use_namespaces, internet)
         if self._backend is None or self._db is None:
             raise RuntimeError(
                 "Topology.deploy() requires backend and db. "
                 "Pass them to Topology(name, backend=..., db=...) or use Engine directly."
             )
         self._engine = Engine(self._backend, self._db,
-                              container_backend=self._container_backend)
+                              container_backend=self._container_backend,
+                              use_namespaces=use_namespaces,
+                              resources=resources,
+                              internet=internet)
         rng = self._engine.deploy(self, cleanup_on_fail=cleanup_on_fail)
         rng._engine = self._engine
         rng._db = self._db
@@ -277,14 +285,27 @@ class Link:
 
 
 class Range:
-    """Live handle to a deployed topology. Returned by Topology.deploy()."""
+    """Live handle to a deployed topology. Returned by Topology.deploy().
 
-    def __init__(self, topology: Topology) -> None:
+    ``internet`` is the outbound-internet policy ("none" or "full") and
+    ``resources`` carries the cgroup limits the range was deployed with. Both
+    only have an effect in namespace mode; in legacy mode they're recorded but
+    the freeze/thaw/internet controls raise if invoked.
+    """
+
+    def __init__(self, topology: Topology, internet: str = "none",
+                 resources: Any = None) -> None:
         self.topology = topology
+        self.internet = internet
+        self.resources = resources
         self._nodes: dict[str, LiveNode] = {}
         self._engine: Any = None
         self._db: Any = None
         self._backend: Any = None
+        # Wired by Engine.deploy() in namespace mode so the runtime freeze/thaw
+        # and internet controls know which cgroup / veth / subnet to act on.
+        self._mgmt_subnet: str | None = None
+        self._veth_host: str | None = None
 
     def __enter__(self) -> Range:
         return self
@@ -327,6 +348,58 @@ class Range:
         if self._db is None:
             raise RuntimeError("Range has no DB reference; cannot fetch logs")
         return self._db.get_logs(self.topology.name, level=level)
+
+    # --- runtime resource + internet controls (namespace mode) ------------
+
+    def freeze(self) -> None:
+        """Atomically pause every process in the range's cgroup (VMs included).
+
+        The freezer suspends all tasks in ``rangectl-<name>`` at once, so VMs
+        stop executing entirely — they go unresponsive until ``thaw()``.
+        """
+        from rangectl import cgroup
+        log.info("Freezing range '%s'", self.topology.name)
+        cgroup.freeze(self.topology.name)
+        if self._db is not None:
+            self._db.log_event(self.topology.name, None, "info", "range frozen")
+
+    def thaw(self) -> None:
+        """Resume a frozen range — all processes continue where they left off."""
+        from rangectl import cgroup
+        log.info("Thawing range '%s'", self.topology.name)
+        cgroup.thaw(self.topology.name)
+        if self._db is not None:
+            self._db.log_event(self.topology.name, None, "info", "range thawed")
+
+    def enable_internet(self) -> None:
+        """Grant the range outbound internet (MASQUERADE via the host uplink)."""
+        from rangectl import internet as internet_mod
+        if self._veth_host is None or self._mgmt_subnet is None:
+            raise RuntimeError(
+                "enable_internet() requires a namespace-mode range "
+                "(deploy with use_namespaces=True)"
+            )
+        log.info("Enabling internet for range '%s'", self.topology.name)
+        internet_mod.enable_internet(self.topology.name, self._mgmt_subnet,
+                                     self._veth_host)
+        self.internet = "full"
+        if self._db is not None:
+            self._db.log_event(self.topology.name, None, "info", "internet enabled")
+
+    def disable_internet(self) -> None:
+        """Revoke the range's outbound internet, removing only its own rules."""
+        from rangectl import internet as internet_mod
+        if self._veth_host is None or self._mgmt_subnet is None:
+            raise RuntimeError(
+                "disable_internet() requires a namespace-mode range "
+                "(deploy with use_namespaces=True)"
+            )
+        log.info("Disabling internet for range '%s'", self.topology.name)
+        internet_mod.disable_internet(self.topology.name, self._mgmt_subnet,
+                                      self._veth_host)
+        self.internet = "none"
+        if self._db is not None:
+            self._db.log_event(self.topology.name, None, "info", "internet disabled")
 
 
 class LiveNode:

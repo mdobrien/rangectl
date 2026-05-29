@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from rangectl import Topology
+from rangectl.cgroup import Resources
 from rangectl.engine import Engine
-from rangectl.topology import Link, LiveNode
+from rangectl.topology import Link, LiveNode, Range
 
 
 def _two_node_topo(backend, db, name="rng"):
@@ -199,3 +200,59 @@ def test_link_down_without_deploy_raises():
     lnk = t.link(a.eth1["10.0.0.1/24"], b.eth1["10.0.0.2/24"])
     with pytest.raises(RuntimeError):
         lnk.down()
+
+
+# ---------- Range SDK surface: internet / resources / freeze / thaw -------
+
+def _range(name="sdk", internet="none", resources=None) -> Range:
+    return Range(Topology(name), internet=internet, resources=resources)
+
+
+def test_range_constructor_accepts_internet_and_resources():
+    res = Resources(memory="32G", cpus=8)
+    rng = _range("lab", internet="full", resources=res)
+    assert rng.internet == "full"
+    assert rng.resources is res
+
+
+def test_range_internet_defaults_to_none():
+    assert _range().internet == "none"
+
+
+def test_range_freeze_calls_cgroup(monkeypatch):
+    from rangectl import cgroup as cgroup_mod
+    calls = []
+    monkeypatch.setattr(cgroup_mod, "freeze", lambda n: calls.append(("freeze", n)))
+    monkeypatch.setattr(cgroup_mod, "thaw", lambda n: calls.append(("thaw", n)))
+    rng = _range("frz")
+    rng.freeze()
+    rng.thaw()
+    assert calls == [("freeze", "frz"), ("thaw", "frz")]
+
+
+def test_range_enable_internet_calls_module(monkeypatch):
+    from rangectl import internet as internet_mod
+    calls = []
+    monkeypatch.setattr(internet_mod, "enable_internet",
+                        lambda n, subnet, veth: calls.append(("enable", n, subnet, veth)))
+    monkeypatch.setattr(internet_mod, "disable_internet",
+                        lambda n, subnet, veth: calls.append(("disable", n, subnet, veth)))
+    rng = _range("inet")
+    rng._mgmt_subnet = "10.255.1.0/24"
+    rng._veth_host = "mgh1234"
+    rng.enable_internet()
+    assert rng.internet == "full"
+    rng.disable_internet()
+    assert rng.internet == "none"
+    assert calls == [
+        ("enable", "inet", "10.255.1.0/24", "mgh1234"),
+        ("disable", "inet", "10.255.1.0/24", "mgh1234"),
+    ]
+
+
+def test_range_enable_internet_requires_namespace_mode():
+    rng = _range("legacy")  # no _veth_host wired (legacy deploy)
+    with pytest.raises(RuntimeError):
+        rng.enable_internet()
+    with pytest.raises(RuntimeError):
+        rng.disable_internet()
