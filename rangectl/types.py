@@ -58,6 +58,7 @@ class InjectMethod(Enum):
 class OSType(Enum):
     LINUX = "linux"
     WINDOWS = "windows"
+    VYOS = "vyos"
 
 
 @dataclass
@@ -126,3 +127,4 @@ class VMSpec:
     mgmt_ip: str | None = None
     topology_name: str | None = None
     ssh_user: str = "ubuntu"
+    ssh_password: str | None = None

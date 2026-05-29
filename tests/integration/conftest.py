@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -9,11 +10,19 @@ import pytest
 from rangectl.libvirt_backend import LibvirtBackend
 from rangectl.state import StateDB
 
+log = logging.getLogger(__name__)
+
+MGMT_SUBNET_CIDR = "192.168.100.0/24"
+
 # Standard locations on the EC2 host (set up by ec2-bootstrap.sh).
 LIBVIRT_IMAGES = Path("/var/lib/libvirt/images")
 IMAGE_PATHS = {
-    "ubuntu-22.04": LIBVIRT_IMAGES / "jammy-server-cloudimg-amd64.img",
-    "ubuntu-24.04": LIBVIRT_IMAGES / "noble-server-cloudimg-amd64.img",
+    "ubuntu-22.04": (
+        LIBVIRT_IMAGES / "jammy-server-cloudimg-amd64.img", "linux"),
+    "ubuntu-24.04": (
+        LIBVIRT_IMAGES / "noble-server-cloudimg-amd64.img", "linux"),
+    "vyos": (
+        LIBVIRT_IMAGES / "vyos-rolling-amd64.qcow2", "vyos"),
 }
 
 
@@ -36,10 +45,10 @@ pytestmark_skip = pytest.mark.skipif(
 @pytest.fixture
 def db(tmp_path) -> StateDB:
     state = StateDB(db_path=str(tmp_path / "state.db"))
-    for name, path in IMAGE_PATHS.items():
+    for name, (path, os_type) in IMAGE_PATHS.items():
         if path.exists():
             state.add_image(name=name, path=str(path), inject="cloud-init",
-                            os_type="linux")
+                            os_type=os_type)
     try:
         yield state
     finally:
@@ -49,3 +58,66 @@ def db(tmp_path) -> StateDB:
 @pytest.fixture
 def backend() -> LibvirtBackend:
     return LibvirtBackend(ssh_user="ubuntu", ssh_ready_timeout=240)
+
+
+def _primary_iface() -> str | None:
+    """Return the interface name with the default route, or None."""
+    r = subprocess.run(
+        ["ip", "-o", "-4", "route", "show", "default"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    # Example: "default via 172.31.0.1 dev ens5 proto dhcp src ..."
+    parts = r.stdout.split()
+    if "dev" in parts:
+        return parts[parts.index("dev") + 1]
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def vm_internet_nat():
+    """Enable IPv4 forwarding + MASQUERADE so VMs on mgmt bridge reach internet.
+
+    Idempotent: skips ops that already exist. Cleans up on session teardown.
+    No-op if libvirt is unavailable (local dev) or we can't detect a primary
+    interface (no default route — unit-only environment).
+    """
+    if not _have_libvirt():
+        yield
+        return
+    iface = _primary_iface()
+    if not iface:
+        log.warning("No default-route interface; skipping VM NAT setup")
+        yield
+        return
+
+    # Enable forwarding (idempotent; sysctl just sets value).
+    subprocess.run(["sudo", "sysctl", "-w", "net.ipv4.ip_forward=1"],
+                   check=False, capture_output=True)
+
+    masq_rule = [
+        "-t", "nat", "-A", "POSTROUTING",
+        "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE",
+    ]
+    check_rule = ["sudo", "iptables", "-t", "nat", "-C", "POSTROUTING",
+                  "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE"]
+    existed = subprocess.run(check_rule, capture_output=True).returncode == 0
+    if not existed:
+        log.info("Adding MASQUERADE: %s -> %s", MGMT_SUBNET_CIDR, iface)
+        subprocess.run(["sudo", "iptables", *masq_rule],
+                       check=True, capture_output=True)
+    else:
+        log.info("MASQUERADE already present for %s -> %s",
+                 MGMT_SUBNET_CIDR, iface)
+
+    try:
+        yield
+    finally:
+        if not existed:
+            log.info("Removing MASQUERADE: %s -> %s", MGMT_SUBNET_CIDR, iface)
+            subprocess.run(
+                ["sudo", "iptables", "-t", "nat", "-D", "POSTROUTING",
+                 "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE"],
+                check=False, capture_output=True,
+            )

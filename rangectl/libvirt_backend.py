@@ -40,8 +40,6 @@ def _xml_for(spec: VMSpec) -> str:
     """Build libvirt domain XML from VMSpec."""
     if not spec.overlay_path:
         raise ValueError("VMSpec.overlay_path required")
-    if not spec.seed_iso_path:
-        raise ValueError("VMSpec.seed_iso_path required")
 
     iface_xml = []
     for ifs in spec.interfaces:
@@ -60,6 +58,16 @@ def _xml_for(spec: VMSpec) -> str:
       <mac address='{ifs.mac}'/>
       <model type='virtio'/>
     </interface>""")
+
+    cdrom_xml = ""
+    if spec.seed_iso_path:
+        cdrom_xml = f"""    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='{spec.seed_iso_path}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+"""
 
     return f"""<domain type='kvm'>
   <name>{spec.name}</name>
@@ -86,13 +94,7 @@ def _xml_for(spec: VMSpec) -> str:
       <source file='{spec.overlay_path}'/>
       <target dev='vda' bus='virtio'/>
     </disk>
-    <disk type='file' device='cdrom'>
-      <driver name='qemu' type='raw'/>
-      <source file='{spec.seed_iso_path}'/>
-      <target dev='sda' bus='sata'/>
-      <readonly/>
-    </disk>
-{chr(10).join(iface_xml)}
+{cdrom_xml}{chr(10).join(iface_xml)}
     <serial type='pty'><target port='0'/></serial>
     <console type='pty'><target type='serial' port='0'/></console>
     <channel type='unix'>
@@ -110,6 +112,9 @@ class LibvirtBackend:
         self._lock = Lock()
         self._vm_mgmt_ip: dict[str, str] = {}
         self._vm_topo: dict[str, str] = {}
+        self._vm_ssh_user: dict[str, str] = {}
+        self._vm_ssh_password: dict[str, str | None] = {}
+        self._vyos_bootstrap: dict[str, dict] = {}  # vm_id -> bootstrap payload
         self._topo_keys: dict[str, tuple[str, str]] = {}  # topo_name -> (priv_path, pubkey)
         self._ssh_user = ssh_user
         self._ssh_ready_timeout = ssh_ready_timeout
@@ -148,6 +153,167 @@ class LibvirtBackend:
                     )
             return self._topo_keys[topology_name][0]
 
+    def prepare_vyos_bootstrap(self, vm_id: str, ifaces: list[dict],
+                                ssh_pubkey: str, host_ip: str) -> None:
+        """Register VyOS first-boot config to be applied via serial console.
+
+        Called by the engine before start(). `ifaces` entries each carry
+        `eth_name` (e.g. 'eth0'), `ip`, `cidr`, and an optional `gateway`.
+        The mgmt interface should be first.
+        """
+        with self._lock:
+            self._vyos_bootstrap[vm_id] = {
+                "ifaces": ifaces,
+                "ssh_pubkey": ssh_pubkey,
+                "host_ip": host_ip,
+            }
+
+    def _bootstrap_vyos_via_console(self, vm_id: str, bootstrap: dict) -> None:
+        """Drive `virsh console` with pexpect to apply first-boot VyOS config.
+
+        Assumes the VyOS image is built so interface naming is deterministic
+        (PCI-slot order → eth0, eth1, eth2, …). The seed_ifaces eth_name
+        field is trusted as-is.
+        """
+        import pexpect
+
+        ifaces = bootstrap["ifaces"]
+        ssh_pubkey = bootstrap["ssh_pubkey"]
+
+        parts = ssh_pubkey.strip().split(None, 2)
+        if len(parts) < 2:
+            raise ValueError(f"unexpected ssh pubkey format: {ssh_pubkey!r}")
+        key_type, key_data = parts[0], parts[1]
+        # VyOS accepts the full OpenSSH type string (ssh-ed25519, ssh-rsa, …).
+        vyos_type = key_type
+
+        # Pre-bootstrap kernel renames + VyOS hw-id pinning. VyOS's initramfs
+        # udev script (vyos_net_name) renames every virtio NIC to e<IFINDEX>
+        # — kernel ifindex N starts at 2 (lo=1), so slot-i lands on e<i+2>.
+        # VyOS's CLI then rejects those names ("Invalid Ethernet interface
+        # name"). We:
+        #   1) rename e<i+2> -> eth<i> at the kernel via `ip link set name`
+        #      so VyOS sees devices with the names its CLI accepts.
+        #   2) `set interfaces ethernet eth<i> hw-id <MAC>` inside configure,
+        #      which writes config.boot mappings vyos_net_name reads on
+        #      subsequent boots — making the rename persistent.
+        rename_cmds: list[tuple[str, str]] = []
+        cmds: list[str] = []
+        for i, iface in enumerate(ifaces):
+            eth = iface.get("eth_name")
+            ip = iface.get("ip")
+            cidr = iface.get("cidr")
+            mac = iface.get("mac")
+            if not eth or not ip:
+                continue
+            kernel_name = f"e{i + 2}"
+            if kernel_name != eth:
+                rename_cmds.append((kernel_name, eth))
+            if mac:
+                cmds.append(f"set interfaces ethernet {eth} hw-id {mac}")
+            cmds.append(f"set interfaces ethernet {eth} address {ip}/{cidr}")
+            gw = iface.get("gateway")
+            if gw:
+                cmds.append(f"set protocols static route 0.0.0.0/0 next-hop {gw}")
+        cmds.append("set service ssh port 22")
+        cmds.append("set service ssh listen-address 0.0.0.0")
+        cmds.append(
+            f"set system login user vyos authentication public-keys "
+            f"rangectl type {vyos_type}"
+        )
+        cmds.append(
+            f"set system login user vyos authentication public-keys "
+            f"rangectl key {key_data}"
+        )
+
+        log.info("[%s] bootstrapping VyOS via serial console (%d cmds)",
+                 vm_id, len(cmds))
+        child = pexpect.spawn(f"virsh console {vm_id}", encoding="utf-8",
+                              timeout=180)
+        log_buf: list[str] = []
+        child.logfile_read = type("Tee", (), {
+            "write": lambda self, s: (log_buf.append(s), None)[1],
+            "flush": lambda self: None,
+        })()
+
+        prompt_op = r"vyos@vyos:~\$"
+        prompt_cfg = r"vyos@vyos#"
+
+        try:
+            time.sleep(2)
+            child.sendline("")
+            child.expect(r"vyos login:", timeout=180)
+            child.sendline("vyos")
+            child.expect("Password:", timeout=30)
+            child.sendline("vyos")
+            child.expect(prompt_op, timeout=30)
+
+            child.sendline("stty cols 500")
+            child.expect(prompt_op, timeout=10)
+
+            # Kernel-level rename pass: e<i+2> -> eth<i>. Each is a separate
+            # sendline so we can see per-command failure in the captured log
+            # if a kernel device doesn't exist (e.g. interface count mismatch).
+            for src, dst in rename_cmds:
+                child.sendline(f"sudo ip link set {src} down")
+                child.expect(prompt_op, timeout=15)
+                child.sendline(f"sudo ip link set {src} name {dst}")
+                child.expect(prompt_op, timeout=15)
+                child.sendline(f"sudo ip link set {dst} up")
+                child.expect(prompt_op, timeout=15)
+
+            child.sendline("configure")
+            child.expect(prompt_cfg, timeout=30)
+            for cmd in cmds:
+                child.sendline(cmd)
+                child.expect(prompt_cfg, timeout=30)
+
+            commit_marker_start = len("".join(log_buf))
+            child.sendline("commit")
+            child.expect(prompt_cfg, timeout=120)
+            commit_output = "".join(log_buf)[commit_marker_start:]
+            log.info("[%s] VyOS commit output:\n%s", vm_id, commit_output)
+            # VyOS prints CLI errors but does not change the prompt; detect them.
+            lower = commit_output.lower()
+            if ("error" in lower or "failure" in lower or "invalid" in lower
+                    or "not valid" in lower):
+                log.error("[%s] VyOS commit reported error. Full console tail:\n%s",
+                          vm_id, "".join(log_buf)[-8000:])
+                raise RuntimeError(
+                    f"VyOS commit failed for {vm_id}; see logs above"
+                )
+
+            child.sendline("save")
+            child.expect(prompt_cfg, timeout=30)
+
+            # Sanity probe: ask VyOS for its interface state. Captured for logs.
+            probe_start = len("".join(log_buf))
+            child.sendline("run show interfaces")
+            child.expect(prompt_cfg, timeout=30)
+            child.sendline("exit")
+            child.expect(prompt_op, timeout=15)
+            probe_out = "".join(log_buf)[probe_start:]
+            log.info("[%s] VyOS interface probe:\n%s", vm_id, probe_out)
+
+            # Operational-mode IP check from the linux side.
+            probe2_start = len("".join(log_buf))
+            child.sendline("ip -br addr show")
+            child.expect(prompt_op, timeout=15)
+            probe2_out = "".join(log_buf)[probe2_start:]
+            log.info("[%s] VyOS linux addr probe:\n%s", vm_id, probe2_out)
+        except Exception:
+            log.error("VyOS console bootstrap failed for %s. Console tail:\n%s",
+                      vm_id, "".join(log_buf)[-8000:])
+            raise
+        finally:
+            try:
+                child.sendcontrol("]")
+            except Exception:
+                pass
+            child.close(force=True)
+
+        log.info("[%s] VyOS bootstrap complete", vm_id)
+
     # --- VM lifecycle ---
 
     def create_vm(self, spec: VMSpec) -> str:
@@ -161,11 +327,21 @@ class LibvirtBackend:
                 self._vm_mgmt_ip[spec.name] = spec.mgmt_ip
             if spec.topology_name:
                 self._vm_topo[spec.name] = spec.topology_name
+            self._vm_ssh_user[spec.name] = spec.ssh_user
+            self._vm_ssh_password[spec.name] = spec.ssh_password
         return spec.name
 
     def start(self, vm_id: str) -> None:
         log.info("start: %s", vm_id)
         _run(["virsh", "start", vm_id])
+        # When a VyOS image is in use cloud-init never runs, so we have to
+        # drive the serial console to assign the mgmt IP and install the
+        # topology pubkey before SSH on the mgmt subnet will work. The engine
+        # supplies the bootstrap config via prepare_vyos_bootstrap() before
+        # calling start().
+        bootstrap = self._vyos_bootstrap.get(vm_id)
+        if bootstrap is not None:
+            self._bootstrap_vyos_via_console(vm_id, bootstrap)
         mgmt_ip = self._vm_mgmt_ip.get(vm_id)
         if mgmt_ip:
             self._wait_for_ssh(mgmt_ip)
@@ -190,6 +366,9 @@ class LibvirtBackend:
         with self._lock:
             self._vm_mgmt_ip.pop(vm_id, None)
             self._vm_topo.pop(vm_id, None)
+            self._vm_ssh_user.pop(vm_id, None)
+            self._vm_ssh_password.pop(vm_id, None)
+            self._vyos_bootstrap.pop(vm_id, None)
 
     def _dom_state(self, vm_id: str) -> str | None:
         res = _run(["virsh", "domstate", vm_id], check=False)
@@ -281,15 +460,20 @@ class LibvirtBackend:
             raise RuntimeError(
                 f"no mgmt_ip or topology recorded for vm {vm_id!r}"
             )
+        username = self._vm_ssh_user.get(vm_id, self._ssh_user)
+        password = self._vm_ssh_password.get(vm_id)
+        # Always attempt the per-topology key first; fall back to password if
+        # provided. VyOS images take ~30-90s after SSH port opens before the
+        # injected pubkey is committed, so the loop tolerates auth failures.
         key = paramiko.Ed25519Key.from_private_key_file(self._priv_key_for(topo))
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         last_err = None
-        for _ in range(30):
+        for _ in range(60):
             try:
                 client.connect(
                     ip,
-                    username=self._ssh_user,
+                    username=username,
                     pkey=key,
                     timeout=5,
                     auth_timeout=5,
@@ -298,10 +482,28 @@ class LibvirtBackend:
                     look_for_keys=False,
                 )
                 return client
+            except paramiko.AuthenticationException as exc:
+                last_err = exc
+                if password:
+                    try:
+                        client.connect(
+                            ip,
+                            username=username,
+                            password=password,
+                            timeout=5,
+                            auth_timeout=5,
+                            banner_timeout=10,
+                            allow_agent=False,
+                            look_for_keys=False,
+                        )
+                        return client
+                    except Exception as pw_exc:
+                        last_err = pw_exc
+                time.sleep(2)
             except Exception as exc:
                 last_err = exc
                 time.sleep(2)
-        raise RuntimeError(f"ssh connect to {ip} failed: {last_err}")
+        raise RuntimeError(f"ssh connect to {ip} (user={username}) failed: {last_err}")
 
     def exec(self, vm_id: str, cmd: str) -> ExecResult:
         log.info("exec %s: %s", vm_id, cmd)

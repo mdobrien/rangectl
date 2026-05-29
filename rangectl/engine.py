@@ -49,6 +49,20 @@ def _mac_for(topo_name: str, node_name: str, suffix: str) -> str:
     return "52:54:00:" + ":".join(h[i:i + 2] for i in (0, 2, 4))
 
 
+def _guest_iface_name(image_os_type: str, slot_index: int) -> str:
+    """Target interface name the engine/bootstrap will use for the i-th NIC.
+
+    This is the post-bootstrap, configure-time name. Backends are responsible
+    for any OS-specific renaming needed to make the kernel device match
+    (e.g. VyOS's initramfs udev renames eth*→e<IFINDEX> on first boot; the
+    LibvirtBackend bootstrap renames them back to eth<N> before running the
+    VyOS configure CLI, and pins the mapping with `hw-id` so it persists).
+    """
+    if image_os_type == "vyos":
+        return f"eth{slot_index}"
+    return f"if{slot_index}"
+
+
 class Engine:
     """Orchestrates topology deployment using the dependency DAG."""
 
@@ -281,6 +295,12 @@ class Engine:
         image_record = self._db.get_image(node.image)
         image_path = image_record["path"] if image_record else node.image
 
+        # The image record's os_type wins over node.os_type for backend-
+        # specific behavior (cloud-init flavor, ssh user). VyOS needs vyos-
+        # flavored cloud-init and the "vyos" SSH user.
+        image_os_type = (image_record or {}).get("os_type", node.os_type.value)
+        is_vyos = image_os_type == "vyos"
+
         overlay_path = str(OVERLAY_ROOT / topology.name / f"{node.name}.qcow2")
         self._backend.create_overlay(image_path, overlay_path)
 
@@ -296,22 +316,31 @@ class Engine:
         Path(seed_path).parent.mkdir(parents=True, exist_ok=True)
         seed_ifaces = []
         for i, ifs in enumerate(ifaces):
+            # Domain XML orders interfaces as: mgmt first, then topology links
+            # in declaration order. The guest-visible name depends on the OS
+            # (cloud-init netplan vs VyOS initramfs udev).
             seed_ifaces.append({
                 "mac": ifs.mac,
                 "ip": ifs.ip,
                 "cidr": ifs.cidr,
                 "gateway": host_ip if ifs.interface_name == "mgmt" else None,
+                "eth_name": _guest_iface_name(image_os_type, i),
             })
-        try:
-            create_seed_iso(
-                output_path=seed_path,
-                hostname=f"{topology.name}-{node.name}",
-                ssh_pubkey=ssh_pubkey,
-                ifaces=seed_ifaces,
-            )
-        except RuntimeError as exc:
-            log.warning("Skipping seed ISO build (%s); proceeding without it", exc)
+        if is_vyos:
+            # VyOS doesn't run cloud-init in our build, so skip the seed ISO
+            # entirely and bootstrap via serial console after start().
             seed_path = None  # type: ignore[assignment]
+        else:
+            try:
+                create_seed_iso(
+                    output_path=seed_path,
+                    hostname=f"{topology.name}-{node.name}",
+                    ssh_pubkey=ssh_pubkey,
+                    ifaces=seed_ifaces,
+                )
+            except RuntimeError as exc:
+                log.warning("Skipping seed ISO build (%s); proceeding without it", exc)
+                seed_path = None  # type: ignore[assignment]
 
         spec = VMSpec(
             name=f"{topology.name}-{node.name}",
@@ -324,10 +353,20 @@ class Engine:
             seed_iso_path=seed_path,
             mgmt_ip=mgmt_ip,
             topology_name=topology.name,
+            ssh_user="vyos" if is_vyos else "ubuntu",
+            ssh_password="vyos" if is_vyos else None,
         )
         vm_id = self._backend.create_vm(spec)
         with self._lock:
             self._vm_ids[(topology.name, node.name)] = vm_id
+
+        if is_vyos and hasattr(self._backend, "prepare_vyos_bootstrap"):
+            self._backend.prepare_vyos_bootstrap(
+                vm_id=vm_id,
+                ifaces=seed_ifaces,
+                ssh_pubkey=ssh_pubkey,
+                host_ip=host_ip,
+            )
 
         self._backend.start(vm_id)
 
@@ -409,7 +448,21 @@ class Engine:
         # 1. packages — Linux uses apt-get; Windows uses powershell commands.
         if node.os_type == OSType.LINUX and node._packages:
             pkg_list = " ".join(node._packages)
-            self._backend.exec(vm_id, f"apt-get install -y {pkg_list}")
+            # Cloud images run as the non-root `ubuntu` user; package and
+            # service ops always need sudo. Wait for any cloud-init apt lock
+            # to release first, otherwise install races with first-boot
+            # `unattended-upgrades`.
+            self._backend.exec(vm_id, "cloud-init status --wait || true")
+            r = self._backend.exec(
+                vm_id,
+                f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_list}",
+            )
+            if r.exit_code != 0:
+                log.error("[%s/%s] apt-get install failed (rc=%d):\nstdout=%s\nstderr=%s",
+                          topology.name, node.name, r.exit_code, r.stdout, r.stderr)
+                raise RuntimeError(
+                    f"apt-get install failed for {node.name}: {r.stderr.strip()[:300]}"
+                )
         for ps_cmd in node._powershell_commands:
             self._backend.exec(vm_id, f"powershell -Command {ps_cmd}")
 
@@ -429,11 +482,13 @@ class Engine:
         for fn in node._configure_fns:
             fn(live)
 
-        # 5. services — enable then start.
+        # 5. services — enable then start. sudo for Linux (cloud images run
+        # as the unprivileged `ubuntu` user). Windows nodes never set the
+        # Linux services list, so no Windows-side branch needed here.
         for svc in node._services:
             if svc.enabled:
-                self._backend.exec(vm_id, f"systemctl enable {svc.name}")
-            start_cmd = svc.start_cmd or f"systemctl start {svc.name}"
+                self._backend.exec(vm_id, f"sudo systemctl enable {svc.name}")
+            start_cmd = svc.start_cmd or f"sudo systemctl start {svc.name}"
             self._backend.exec(vm_id, start_cmd)
 
         if node.state == NodeState.LINKED:
