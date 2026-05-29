@@ -94,7 +94,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 | 4 | Diamond DAG + snapshot | ✅ PASS (155s) | bfc3180 | All Ubuntu; restore() now resumes paused/shut-off domains |
 | 5 | Link toggle | ✅ PASS (94s) | 87f45c0 | Required SDK fix: TAP re-enslave on Link.up() |
 | 6 | Multi-topology isolation | ✅ PASS (155s) | 36c7949 | Required SDK fix: FORWARD DROP between rlmgt+ bridges (issue 20260529-3) |
-| 7 | Mixed VM + Docker container | ✅ PASS (50s) | uncommitted | nginx container + Ubuntu VM on shared bridge; ping + curl confirmed |
+| 7 | Mixed VM + Docker container | ✅ PASS (50s) | d41dc99 | nginx container + Ubuntu VM on shared bridge; ping + curl confirmed |
 
 ## Progress Log
 
