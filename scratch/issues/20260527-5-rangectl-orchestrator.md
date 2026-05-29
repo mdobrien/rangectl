@@ -14,7 +14,8 @@ You are the team lead for rangectl. You do NOT write code — you spawn coding a
 - **Gate 2 Topo 1**: PASSING (commit 3061922) — 2 Ubuntu VMs, mgmt SSH, topology ping
 - **Gate 2 Topo 2**: PASSING (uncommitted) — VyOS router + 2 Ubuntu hosts, multi-subnet routing
 - **Gate 2 Topo 3**: BLOCKED — deploy + routing work, but `apt-get install nginx` fails because VMs have no internet (mgmt bridges not NAT'd)
-- **Gate 2 Topo 4-6**: Not started
+- **Gate 2 Topo 4**: PASSING (commit bfc3180) — diamond DAG + snapshot/restore on 4 Ubuntu nodes
+- **Gate 2 Topo 5-6**: Not started
 - **EC2 instance**: STOPPED (c5.metal). Run `scratch/scripts/ec2.sh start` to resume.
 - **Team name**: `rangectl`
 
@@ -88,7 +89,7 @@ Always `scratch/scripts/ec2.sh stop` after integration work. c5.metal is $4.08/h
 | 1 | 2 Ubuntu VMs | ✅ PASS (68s) | 3061922 | Committed |
 | 2 | VyOS router + 2 Ubuntu | ✅ PASS (108s) | uncommitted | VyOS serial bootstrap works |
 | 3 | Services + DependencySet | ⏳ BLOCKED | uncommitted | apt-get fails — no VM internet |
-| 4 | Diamond DAG + snapshot | ❌ Not started | | |
+| 4 | Diamond DAG + snapshot | ✅ PASS (155s) | bfc3180 | All Ubuntu; restore() now resumes paused/shut-off domains |
 | 5 | Link toggle | ❌ Not started | | |
 | 6 | Multi-topology isolation | ❌ Not started | | |
 
