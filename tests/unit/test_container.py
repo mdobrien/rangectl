@@ -258,6 +258,48 @@ def test_container_backend_attach_interface_topology_link_uses_iface_name(cb):
     assert any("ip addr add 10.0.1.1/24" in s for s in flat), flat
 
 
+def test_container_backend_attach_interface_netns_mode():
+    """With a range netns, the host-side veth is moved into the netns and the
+    bridge enslavement happens inside it (Phase 11)."""
+    cb = ContainerBackend(netns_name="rangectl-r")
+    spec = VMSpec(
+        name="r-svc",
+        image="nginx:latest",
+        vcpu=1, memory=128, os_type=OSType.LINUX,
+        interfaces=[
+            InterfaceSpec(
+                node_name="svc", interface_name="mgmt",
+                ip="192.168.100.2", cidr="24",
+                bridge="mgmt-br", mac="52:54:00:aa:bb:01",
+            ),
+        ],
+        topology_name="r",
+    )
+    with patch("rangectl.container_backend._run") as run:
+        run.return_value = _run_ok(stdout="r-svc\n")
+        cb.create_vm(spec)
+
+    with patch("rangectl.container_backend._run") as run:
+        def side_effect(cmd, **kw):
+            if cmd[:2] == ["docker", "inspect"]:
+                return _run_ok(stdout="12345\n")
+            # existence check lives inside the netns now; report missing.
+            if cmd[:3] == ["ip", "netns", "exec"] and "show" in cmd:
+                return _run_ok(rc=1, stderr="does not exist")
+            return _run_ok()
+        run.side_effect = side_effect
+        cb.attach_interface("r-svc", "mgmt-br", "52:54:00:aa:bb:01")
+
+    flat = [" ".join(c.args[0]) for c in run.call_args_list]
+    # Host-side veth moved into the range netns.
+    assert any("link set" in s and "netns rangectl-r" in s for s in flat), flat
+    # Bridge enslavement runs inside the netns.
+    assert any(
+        s.startswith("ip netns exec rangectl-r ") and "master mgmt-br" in s
+        for s in flat
+    ), flat
+
+
 # --- Engine dispatch -------------------------------------------------------
 
 class _MockContainerBackend:

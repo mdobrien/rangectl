@@ -5,13 +5,18 @@ import os
 from pathlib import Path
 from threading import Lock, Thread
 
+from rangectl import cgroup, supervisor
 from rangectl.backend import Backend
+from rangectl.cgroup import Resources
 from rangectl.cloudinit import create_seed_iso
+from rangectl.libvirt_backend import LibvirtBackend
 from rangectl.networking import (
     allocate_mgmt_ip,
     bridge_name,
     mgmt_bridge_name,
     mgmt_host_ip,
+    ns_bridge_name,
+    ns_mgmt_bridge_name,
 )
 from rangectl.state import StateDB
 from rangectl.topology import LiveNode, Node, Range, Topology
@@ -67,17 +72,42 @@ class Engine:
     """Orchestrates topology deployment using the dependency DAG."""
 
     def __init__(self, backend: Backend, db: StateDB,
-                 container_backend: Backend | None = None) -> None:
+                 container_backend: Backend | None = None,
+                 use_namespaces: bool = False,
+                 resources: Resources | None = None) -> None:
         self._backend = backend
         self._container_backend = container_backend
         self._db = db
+        # When True, each range gets its own PID/net/mount namespaces and a
+        # per-range libvirtd (see supervisor.py). VM and bridge ops route into
+        # that namespace; bridge names become clean (mgmt-br, data-0, …). When
+        # False the engine behaves exactly as the legacy host-level deploy.
+        self._use_namespaces = use_namespaces
+        self._resources = resources
         # Per-deploy tracking — populated during deploy(), consumed in destroy().
         self._vm_ids: dict[tuple[str, str], str] = {}
         self._mgmt_ips: dict[tuple[str, str], str] = {}
         self._link_bridges: dict[str, list[str]] = {}
+        # Namespace-mode bookkeeping, keyed by topology name.
+        self._range_info: dict[str, supervisor.RangeInfo] = {}
+        self._range_backends: dict[str, Backend] = {}
+        self._range_container_backends: dict[str, Backend] = {}
+        self._cgroup_paths: dict[str, str] = {}
         self._lock = Lock()
 
-    def _backend_for(self, node: Node) -> Backend:
+    # --- backend / bridge-name resolution (namespace-aware) ---
+
+    def _vm_backend(self, topology_name: str) -> Backend:
+        """The backend that drives VM nodes for this topology.
+
+        In namespace mode this is the per-range LibvirtBackend (bound to the
+        range's libvirt socket + netns); otherwise the template backend.
+        """
+        if self._use_namespaces:
+            return self._range_backends[topology_name]
+        return self._backend
+
+    def _backend_for(self, topology_name: str, node: Node) -> Backend:
         """Pick the backend for this node based on type (image vs container)."""
         if node.is_container:
             if self._container_backend is None:
@@ -85,8 +115,38 @@ class Engine:
                     f"node {node.name!r} is a container but no container_backend "
                     "was passed to Engine()"
                 )
+            # In namespace mode containers wire into the range's netns, so use
+            # the per-range container backend (created during _setup_namespace).
+            if self._use_namespaces:
+                return self._range_container_backends[topology_name]
             return self._container_backend
-        return self._backend
+        return self._vm_backend(topology_name)
+
+    def _mgmt_bridge_name(self, topology_name: str) -> str:
+        if self._use_namespaces:
+            return ns_mgmt_bridge_name()
+        return mgmt_bridge_name(topology_name)
+
+    def _link_bridge_name(self, topology_name: str, index: int) -> str:
+        if self._use_namespaces:
+            return ns_bridge_name(index)
+        return bridge_name(topology_name, index)
+
+    def _make_range_backend(self, info: supervisor.RangeInfo) -> Backend:
+        """Create a LibvirtBackend bound to a range's socket + netns, reusing
+        the template backend's ssh settings."""
+        return LibvirtBackend(
+            ssh_user=getattr(self._backend, "_ssh_user", "ubuntu"),
+            ssh_ready_timeout=getattr(self._backend, "_ssh_ready_timeout", 180),
+            libvirt_socket=info.libvirt_socket,
+            netns_name=info.netns_name,
+        )
+
+    def _make_range_container_backend(self, info: supervisor.RangeInfo) -> Backend:
+        """Create a ContainerBackend that wires container veths into the
+        range's netns instead of the host namespace."""
+        from rangectl.container_backend import ContainerBackend
+        return ContainerBackend(netns_name=info.netns_name)
 
     def validate_resources(self, topology: Topology) -> None:
         log.info("Validating host resources for topology '%s'", topology.name)
@@ -150,11 +210,21 @@ class Engine:
         mgmt_subnet = self._db.allocate_mgmt_subnet(topology.name)
         host_ip = mgmt_host_ip(mgmt_subnet)
 
+        # In namespace mode, stand up the range's PID/net/mount namespaces and
+        # per-range libvirtd before any VM/bridge ops. The mgmt bridge + host
+        # gateway IP are created inside the netns by the supervisor, so the
+        # engine does NOT create them here.
+        if self._use_namespaces:
+            self._setup_namespace(topology.name, mgmt_subnet)
+
+        vm_backend = self._vm_backend(topology.name)
+
         log.info("Step 3: Create mgmt bridge")
-        mgmt_bridge = mgmt_bridge_name(topology.name)
-        self._backend.create_bridge(mgmt_bridge)
-        # Give the host an IP on the mgmt bridge so it can SSH into VMs.
-        self._backend.assign_host_ip(mgmt_bridge, host_ip, MGMT_CIDR)
+        mgmt_bridge = self._mgmt_bridge_name(topology.name)
+        if not self._use_namespaces:
+            vm_backend.create_bridge(mgmt_bridge)
+            # Give the host an IP on the mgmt bridge so it can SSH into VMs.
+            vm_backend.assign_host_ip(mgmt_bridge, host_ip, MGMT_CIDR)
 
         # Save topology row now that we have subnet + bridge.
         self._db.save_topology(
@@ -168,8 +238,8 @@ class Engine:
 
         log.info("Step 4: Create topology link bridges")
         for i, _ in enumerate(topology._links):
-            br = bridge_name(topology.name, i)
-            self._backend.create_bridge(br)
+            br = self._link_bridge_name(topology.name, i)
+            vm_backend.create_bridge(br)
             self._link_bridges[topology.name].append(br)
             self._db._conn.execute(
                 "INSERT INTO bridges (topology_name, name, bridge_type) VALUES (?, ?, ?)",
@@ -186,8 +256,10 @@ class Engine:
             self._mgmt_ips[(topology.name, node.name)] = ip
 
         # Eagerly request the topology ssh pubkey so it's available to all
-        # parallel deploy threads (and to seed ISO generation).
-        ssh_pubkey = self._backend.ssh_pubkey(topology.name)
+        # parallel deploy threads (and to seed ISO generation). Must come from
+        # the VM backend so its per-topology key store is populated for the
+        # SSH/VyOS-bootstrap paths that run later on the same instance.
+        ssh_pubkey = vm_backend.ssh_pubkey(topology.name)
 
         log.info("Step 6: Compute waves")
         waves = self.compute_waves(topology)
@@ -219,15 +291,35 @@ class Engine:
                 name=node.name,
                 mgmt_ip=mgmt_ip,
                 topology_name=topology.name,
-                backend=self._backend_for(node),
+                backend=self._backend_for(topology.name, node),
                 vm_id=self._vm_ids[(topology.name, node.name)],
                 db=self._db,
             )
         rng._engine = self
         rng._db = self._db
-        rng._backend = self._backend
+        rng._backend = vm_backend
         log.info("Deployment complete")
         return rng
+
+    def _setup_namespace(self, topology_name: str, mgmt_subnet: str) -> None:
+        """Create cgroup (if resources requested), the range namespaces +
+        per-range libvirtd, and the per-range LibvirtBackend bound to them."""
+        cgroup_path: str | None = None
+        if self._resources is not None:
+            cgroup_path = cgroup.create_cgroup(topology_name, self._resources)
+            self._cgroup_paths[topology_name] = cgroup_path
+
+        info = supervisor.create_range(topology_name, mgmt_subnet)
+        self._range_info[topology_name] = info
+        self._range_backends[topology_name] = self._make_range_backend(info)
+        if self._container_backend is not None:
+            self._range_container_backends[topology_name] = (
+                self._make_range_container_backend(info)
+            )
+
+        # Place libvirtd (and thus every QEMU child it spawns) into the cgroup.
+        if cgroup_path is not None:
+            cgroup.write_pid(cgroup_path, info.pid)
 
     def _deploy_wave(self, topology: Topology, wave: list[Node],
                      mgmt_subnet: str, mgmt_bridge: str,
@@ -276,7 +368,7 @@ class Engine:
             link_idx = self._link_index_for(topology, node.name, iface_name)
             if link_idx is None:
                 continue
-            br = bridge_name(topology.name, link_idx)
+            br = self._link_bridge_name(topology.name, link_idx)
             mac = _mac_for(topology.name, node.name, iface_name)
             ifaces.append(InterfaceSpec(
                 node_name=node.name,
@@ -294,7 +386,7 @@ class Engine:
         log.info("[%s/%s] Provisioning (%s)", topology.name, node.name,
                  "container" if node.is_container else "vm")
         node.state = transition_node_state(node.state, NodeState.PROVISIONING)
-        backend = self._backend_for(node)
+        backend = self._backend_for(topology.name, node)
         # `image` column persists either the VM image or the container image
         # — both are the user-facing source of the node's runtime.
         image_or_container = node.container if node.is_container else node.image
@@ -324,7 +416,7 @@ class Engine:
         is_vyos = image_os_type == "vyos"
 
         overlay_path = str(OVERLAY_ROOT / topology.name / f"{node.name}.qcow2")
-        self._backend.create_overlay(image_path, overlay_path)
+        backend.create_overlay(image_path, overlay_path)
 
         # Build the final interface list with bridges + MACs assigned.
         ifaces = self._build_interface_specs(topology, node, mgmt_bridge)
@@ -378,25 +470,25 @@ class Engine:
             ssh_user="vyos" if is_vyos else "ubuntu",
             ssh_password="vyos" if is_vyos else None,
         )
-        vm_id = self._backend.create_vm(spec)
+        vm_id = backend.create_vm(spec)
         with self._lock:
             self._vm_ids[(topology.name, node.name)] = vm_id
 
-        if is_vyos and hasattr(self._backend, "prepare_vyos_bootstrap"):
-            self._backend.prepare_vyos_bootstrap(
+        if is_vyos and hasattr(backend, "prepare_vyos_bootstrap"):
+            backend.prepare_vyos_bootstrap(
                 vm_id=vm_id,
                 ifaces=seed_ifaces,
                 ssh_pubkey=ssh_pubkey,
                 host_ip=host_ip,
             )
 
-        self._backend.start(vm_id)
+        backend.start(vm_id)
 
         # attach_interface call retained for back-ends that need hot-attach
         # (e.g. MockBackend tests count these). For LibvirtBackend it's a no-op
         # since interfaces are inlined into the domain XML.
-        self._backend.attach_interface(vm_id, mgmt_bridge,
-                                       _mac_for(topology.name, node.name, "mgmt"))
+        backend.attach_interface(vm_id, mgmt_bridge,
+                                 _mac_for(topology.name, node.name, "mgmt"))
 
         # Update DB row with mgmt_ip.
         self._db.save_node(
@@ -418,8 +510,7 @@ class Engine:
     def _deploy_container_node(self, topology: Topology, node: Node,
                                 mgmt_bridge: str, host_ip: str) -> None:
         """Provision a Docker container node and wire its mgmt interface."""
-        cb = self._container_backend
-        assert cb is not None  # _backend_for() would have raised otherwise.
+        cb = self._backend_for(topology.name, node)
 
         ifaces = self._build_interface_specs(topology, node, mgmt_bridge)
         mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
@@ -461,7 +552,7 @@ class Engine:
                            f"ready (container), mgmt_ip={mgmt_ip}")
 
     def _wire_link(self, topology: Topology, link, link_index: int) -> None:
-        br = bridge_name(topology.name, link_index)
+        br = self._link_bridge_name(topology.name, link_index)
         log.info("[%s] Wiring link %d: %s/%s <-> %s/%s via %s",
                  topology.name, link_index,
                  link.if_a.node_name, link.if_a.interface_name,
@@ -476,7 +567,9 @@ class Engine:
         self._db._conn.commit()
 
         # Wire Link with backend/bridge refs so Link.down()/up() can work later.
-        link._backend = self._backend
+        # In namespace mode this is the per-range backend so bridge recreate
+        # happens inside the range's netns.
+        link._backend = self._vm_backend(topology.name)
         link._bridge_name = br
         link._db = self._db
         link._topology_name = topology.name
@@ -491,7 +584,7 @@ class Engine:
             mac = _mac_for(topology.name, side.node_name, side.interface_name)
             link._endpoints.append((vm_id, mac))
             side_node = topology._nodes[side.node_name]
-            self._backend_for(side_node).attach_interface(vm_id, br, mac)
+            self._backend_for(topology.name, side_node).attach_interface(vm_id, br, mac)
 
         for side in (link.if_a, link.if_b):
             node = topology._nodes[side.node_name]
@@ -508,7 +601,7 @@ class Engine:
 
         vm_id = self._vm_ids[(topology.name, node.name)]
         mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
-        backend = self._backend_for(node)
+        backend = self._backend_for(topology.name, node)
         live = LiveNode(
             name=node.name,
             mgmt_ip=mgmt_ip,
@@ -581,19 +674,35 @@ class Engine:
             except Exception:
                 node.state = NodeState.DESTROYING
             self._db.update_node_state(topology.name, node.name, node.state.value)
-            node_backend = self._backend_for(node)
+            node_backend = self._backend_for(topology.name, node)
             node_backend.stop(vm_id)
             node_backend.destroy(vm_id)
             node.state = transition_node_state(node.state, NodeState.DESTROYED)
             self._db.update_node_state(topology.name, node.name, node.state.value)
             self._vm_ids.pop((topology.name, node.name), None)
 
-        for br in self._link_bridges.get(topology.name, []):
-            self._backend.delete_bridge(br)
+        if self._use_namespaces:
+            # One supervisor teardown kills the range's libvirtd PID namespace
+            # (reaping every QEMU child) and removes the netns, mgmt network,
+            # data bridges (they live inside the netns), and range dir.
+            self._teardown_namespace(topology.name)
+        else:
+            for br in self._link_bridges.get(topology.name, []):
+                self._backend.delete_bridge(br)
+            self._backend.delete_bridge(mgmt_bridge_name(topology.name))
         self._link_bridges.pop(topology.name, None)
-
-        self._backend.delete_bridge(mgmt_bridge_name(topology.name))
 
         self._db.free_mgmt_subnet(topology.name)
         self._db.delete_topology(topology.name)
         log.info("Destroy complete for '%s'", topology.name)
+
+    def _teardown_namespace(self, topology_name: str) -> None:
+        """Tear down the range's namespaces + per-range libvirtd, then its
+        cgroup (if one was created)."""
+        supervisor.destroy_range(topology_name)
+        self._range_info.pop(topology_name, None)
+        self._range_backends.pop(topology_name, None)
+        self._range_container_backends.pop(topology_name, None)
+        cgroup_path = self._cgroup_paths.pop(topology_name, None)
+        if cgroup_path is not None:
+            cgroup.destroy_cgroup(topology_name)

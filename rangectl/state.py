@@ -40,9 +40,13 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE TABLE IF NOT EXISTS bridges (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     topology_name TEXT NOT NULL REFERENCES topologies(name),
-    name TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
     subnet TEXT,
-    bridge_type TEXT NOT NULL  -- 'mgmt' or 'topology'
+    bridge_type TEXT NOT NULL,  -- 'mgmt' or 'topology'
+    -- Namespace-scoped bridge names (data-0, mgmt-br) repeat across ranges,
+    -- so uniqueness is per-topology, not global. Legacy hashed names are
+    -- globally unique anyway, so this is strictly looser.
+    UNIQUE(topology_name, name)
 );
 
 CREATE TABLE IF NOT EXISTS links (

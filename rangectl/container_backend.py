@@ -59,12 +59,24 @@ def _guest_dev_name(iface: InterfaceSpec) -> str:
 
 class ContainerBackend:
 
-    def __init__(self) -> None:
+    def __init__(self, netns_name: str | None = None) -> None:
         self._lock = Lock()
         # vm_id (container name) -> list of InterfaceSpec captured at create_vm.
         # attach_interface() looks up by MAC to find the corresponding spec
         # so it can do the veth + IP wiring with the right guest device name.
         self._specs: dict[str, list[InterfaceSpec]] = {}
+        # When set, the topology bridges live inside this network namespace
+        # (per-range isolation, Phase 11). The host-side veth is moved into the
+        # netns and enslaved to the bridge there; otherwise everything stays in
+        # the host namespace (legacy behaviour).
+        self._netns_name = netns_name
+
+    def _netns(self, cmd: list[str]) -> list[str]:
+        """Prefix ``ip netns exec <ns>`` when a range netns is configured so
+        host-side bridge/veth ops land inside it."""
+        if self._netns_name:
+            return ["ip", "netns", "exec", self._netns_name, *cmd]
+        return cmd
 
     # --- lifecycle -----------------------------------------------------
 
@@ -161,8 +173,9 @@ class ContainerBackend:
         # If we've already wired this interface (e.g. duplicate attach call
         # on initial deploy + topology link), short-circuit. The host-side
         # veth name is deterministic per (vm_id, mac), so its existence is
-        # the marker.
-        check = _run(["ip", "link", "show", host_veth], check=False)
+        # the marker. In netns mode the host-side veth lives in the range's
+        # namespace, so check there.
+        check = _run(self._netns(["ip", "link", "show", host_veth]), check=False)
         if check.returncode == 0:
             log.debug("attach_interface: veth %s already present, skipping",
                       host_veth)
@@ -183,12 +196,16 @@ class ContainerBackend:
                  "host_veth=%s guest_dev=%s pid=%s",
                  vm_id, mac, bridge, host_veth, guest_dev, pid)
 
-        # Create veth pair: host_veth <-> ctr_veth.
+        # Create veth pair: host_veth <-> ctr_veth (in the host namespace).
         _run(["ip", "link", "add", host_veth, "type", "veth",
               "peer", "name", ctr_veth])
-        # Host side: enslave to bridge and bring up.
-        _run(["ip", "link", "set", host_veth, "master", bridge])
-        _run(["ip", "link", "set", host_veth, "up"])
+        # Host side: in netns mode the bridge lives inside the range's network
+        # namespace, so move host_veth there and enslave it inside the netns;
+        # otherwise enslave directly on the host.
+        if self._netns_name:
+            _run(["ip", "link", "set", host_veth, "netns", self._netns_name])
+        _run(self._netns(["ip", "link", "set", host_veth, "master", bridge]))
+        _run(self._netns(["ip", "link", "set", host_veth, "up"]))
         # Container side: move into netns, rename, set MAC, assign IP, bring up.
         _run(["ip", "link", "set", ctr_veth, "netns", pid])
         _run(["nsenter", "-t", pid, "-n",
