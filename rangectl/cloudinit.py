@@ -38,7 +38,12 @@ def _network_config(ifaces: list[dict]) -> str:
             continue
         lines.append(f"  if{i}:")
         lines.append("    match:")
-        lines.append(f"      macaddress: {iface['mac']}")
+        # Quote the MAC: an all-numeric MAC whose octets are each <= 59 (e.g.
+        # 52:54:00:35:18:16) is otherwise parsed by YAML as a base-60
+        # (sexagesimal) integer, so netplan/cloud-init sees an int instead of a
+        # string, fails device matching ('int' object has no attribute 'lower'),
+        # and never configures the interface. Quoting forces a string always.
+        lines.append(f'      macaddress: "{iface["mac"]}"')
         lines.append("    set-name: " + f"if{i}")
         lines.append("    dhcp4: false")
         lines.append("    addresses:")

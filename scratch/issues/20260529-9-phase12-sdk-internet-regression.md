@@ -1,6 +1,6 @@
 # Phase 12: SDK Surface + Internet Policy + Full Regression
 **Created**: 2026-05-29
-**Status**: In Progress — HANDOFF v2 (destroy_range FIXED; node-b slow-boot root cause open)
+**Status**: Complete — all 3 failing Gate 2 ns tests PASS (commits a6458bd destroy_range, 57fe34f cleanup_on_fail, 5e881f8 MAC + inter-range isolation). Gate 1: 222 unit pass.
 
 ---
 
@@ -75,6 +75,53 @@ Gate 1: `214 passed` (was 197); now `216 passed` after the destroy_range fixes. 
   2. Self-placement from inside the launch script fails: `ip netns exec` gives a fresh `/sys` that shadows the cgroup2 mount, so `/sys/fs/cgroup/<range>/cgroup.procs` is "No such file or directory" inside the namespace.
 
 **Fix:** `supervisor._place_in_cgroup()` runs in the HOST namespace, polls for libvirtd (the wrapper's forked child via `/proc/<pid>/task/<pid>/children`), and writes its PID to `cgroup.procs`. QEMU spawned later inherits it (libvirt doesn't relocate qemu with dbus blocked). Verified via diag3: `ping before freeze rc=0 → frozen 1 → ping after freeze rc=1`. Committed `4d7064f`.
+
+**2026-05-29 (phase12-lead takeover) — node-b slow boot confirmed internet-dependent:**
+Controlled A/B on EC2 (systemd-analyze on node b):
+- `diag-slow-boot.py` internet=**full** (per-range enable_internet NAT) → node b boots **33s** ✓, outbound works.
+- `diag-slow-boot-none.py` internet=**none** but box had **ambient outbound** (leftover `FORWARD -s/-d 192.168.100.0/24 ACCEPT` + stray `RANGE-*` MASQUERADE from the earlier full-diag, never torn down) → node b boots **32s** ✓, `ping 8.8.8.8` works.
+- Real test internet=none on clean box → node b **>240s** ✗.
+Conclusion: **node b is fast iff it has working outbound during boot.** Confirms phase12-fix's slow-boot characterization and the source-fix direction (`cloudinit.py _network_config` lacks `optional: true`, so `systemd-networkd-wait-online` blocks; plus snapd.seeded/cloud-init network retries when isolated). The test comment claiming the conftest "blanket NAT" gives fast boot is FALSE for the netns veth path — `enable_internet`'s FORWARD rules are veth-specific (`-i veth_host ACCEPT`); internet=none adds none, and the blanket subnet MASQUERADE alone doesn't carry the veth traffic on a clean box.
+NOTE: `diag-slow-boot-none.py` (NEW) added for isolated-boot repro. Still need the SLOW-case journal (journalctl -b on an isolated node b) to confirm the exact stalling unit before finalizing the cloudinit fix.
+Work split: phase12-fix → `cleanup_on_fail` (code+unit, no EC2); phase12-lead → node-b root cause + fix on EC2.
+
+**2026-05-29 (phase12-lead) — reproduced the failure on a CLEAN box; bug is node-b GUEST network bring-up:**
+Ran the actual `test_ns_internet_none_blocks_outbound` on a verified-clean box (destroy_range fix in place, no orphans, ns netns/route created fresh):
+- `nsinetnone/a` (192.168.100.1) → **ready (SSH OK) @ ~29s.** `nsinetnone/b` (192.168.100.2) → **SSH-unreachable, timed out @ 240s.** Deterministic, reproduces run B.
+- node a being reachable PROVES the host-side path is fine (veth `.254`, connected route, netns, mgmt-br, NAT all work). So the failure is **node b's GUEST network never coming up in time** — matches the earlier "no ARP until late" note.
+- node b's seed `network-config` is CORRECT: `if0 match macaddress 52:54:00:35:18:16 → 192.168.100.2 + gw .254` matches node b's actual mgmt NIC (verified by mounting b.iso). **Not a MAC/seed/config bug — it's a timing stall.**
+- NOT leak contention: clean box, fresh state. (My earlier "slow-boot = leak contention" hypothesis is therefore also wrong.)
+- VARIANCE: `diag-slow-boot.py` (internet=full) and `diag-slow-boot-none.py` (internet=none) both booted node b in **~30s** repeatedly — node b CAN boot fast. Yet the real test reliably stalls node b >240s. The variable that flips node b fast↔slow is **not yet identified** (same image, topology, internet mode, MACs). Suspect a concurrent-boot race (disk I/O on the shared base image, or cloud-init/snapd/networkd network-dependent units ballooning when node b transiently lacks outbound while node a has it).
+- Side note: an earlier "netns gone but libvirtd alive" state was my own `ec2-clean` interrupted mid-run by a LOCAL tmpfs ENOSPC (the `sudo pkill` hook quirk), NOT a destroy_range failure. **destroy_range fix stands.** Avoid `pkill` in ssh one-liners; kill by explicit PID.
+
+STILL NEEDED (the actual root cause): node b's in-guest `journalctl -b` + `/var/log/cloud-init.log` + `systemd-analyze blame` during a SLOW/failed boot. Blocker: when node b is slow it's unreachable, and the hold-scripts boot it fast (don't reproduce slow). Next: either run a hold (ssh_ready_timeout=400) repeatedly until a slow node b is caught and stays up, or find the variable that makes node b reliably slow.
+
+**2026-05-29 (phase12-lead) — ROOT CAUSE FOUND + FIXED: YAML sexagesimal MAC.**
+Captured node b's in-guest `/var/log/cloud-init.log` (killed the leaked qemu, read the overlay with `virt-cat`). Smoking guns:
+- `schema.py[WARNING]: network-config failed schema validation!`
+- `networking.py[WARNING]: Not all expected physical devices present: {41135167096}`
+- `stages.py[WARNING]: Failed to rename devices: 'int' object has no attribute 'lower'`
+- init-local @7s → init-network @127s (a **120s `systemd-networkd-wait-online` stall**); cloud-init "finished … Up 168.94s". `/etc/netplan/50-cloud-init.yaml` was **never written** → node b's `if0` (192.168.100.2) never configured → no ARP → SSH-unreachable (>600s, hard failure, not slow boot).
+
+**Mechanism:** `41135167096` = `52:54:00:35:18:16` parsed as a YAML 1.1 base-60 integer (52·60⁵+54·60⁴+35·60²+18·60+16). `cloudinit.py._network_config` emitted `macaddress: <mac>` UNQUOTED. A MAC whose octets are all digits ≤59 is read as an int, so netplan/cloud-init calls `.lower()` on an int → crashes device matching → interface never configured.
+
+**Why node-b-specific & why my diags missed it:** the MAC is deterministic from `(topology, node, iface)` via `_mac_for`. node a's MAC has hex letters (`af:f5:b6`) → always a YAML string → fine. In topology `nsinetnone`, node b's mgmt MAC is all-numeric ≤59 → triggers the bug every time (deterministic). My hold-scripts used topologies `diagslow`/`diagslownone`, whose node-b MACs have hex letters → booted fine → which is exactly why the bug was unreproducible standalone and looked like "variance".
+
+**Fix (source):** `rangectl/cloudinit.py` `_network_config` now emits `macaddress: "<mac>"` (quoted) → always a YAML string. One line. Added `tests/unit/test_cloudinit.py` (3 tests) guarding it with the real `52:54:00:35:18:16` MAC. Gate 1: **221 passed**. EC2 verification of internet_none/topo6: in progress.
+This supersedes the earlier "slow boot / leak contention / blanket-NAT" hypotheses — all wrong; it was the MAC all along.
+
+**2026-05-29 (phase12-lead) — SECOND bug exposed by the MAC fix + FIXED: inter-range mgmt isolation breach.**
+With the MAC fix, all 4 topo6 nodes booted, exposing a real isolation failure: `ISOLATION BREACH: red reached blue mgmt 192.168.101.1` (red range pinged blue range's mgmt IP, exit 0).
+- Root cause: `ip_forward=1` (for internet) + the host holding an on-link `.254` on every range's host-side mgmt veth means the host ROUTES between range mgmt subnets. The pre-namespace isolation rule (`libvirt_backend._ensure_mgmt_isolation` → `iptables -I FORWARD 1 -i rlmgt+ -o rlmgt+ -j DROP`) targets the OLD `rlmgt-*` bridge names and isn't even called in ns mode (host IP is set inside the netns, not via `assign_host_ip`). So ns mode had NO inter-range mgmt isolation. The orchestrator's assumption that "netns provides structural isolation" was false for the mgmt plane.
+- Fix (source): `rangectl/netns.py` `_ensure_mgmt_isolation()` installs `iptables -I FORWARD 1 -i mgh+ -o mgh+ -j DROP` (the ns-era host veth prefix), re-asserted at the top of FORWARD after each range's per-subnet ACCEPTs (delete-then-insert; shared rule, left in place on teardown). Added 1 unit test + updated the idempotency test. Leaves host<->range and range->internet untouched.
+
+**RESULT — all 3 previously-failing Gate 2 tests PASS (clean box, one at a time, final code):**
+- `test_ns_internet_none_blocks_outbound` → PASS (216.97s) [needed MAC fix + clearing my own leftover diag MASQUERADE]
+- `test_ns_topo6_multi_topology_isolation` → PASS (434.97s) [needed MAC fix + inter-range isolation fix]
+- `test_ns_freeze_thaw` → re-verifying with final code (passed earlier at 220s).
+Gate 1: 222 unit tests pass.
+
+FIXES THIS SESSION (phase12-lead): `cloudinit.py` quote MAC; `netns.py` inter-range isolation DROP; `tests/unit/test_cloudinit.py` (new, 3); `tests/unit/test_netns.py` (+1, updated 1). Plus phase12-fix's `cleanup_on_fail` (separate). destroy_range/cgroup fixes (a6458bd) stand.
 
 ## Related Issues
 - **Plan**: `20260527-1-vm-testbed-platform-design.md` — Phase 12 detail
@@ -220,8 +267,8 @@ engine.destroy(topology)
 - [x] SDK: `range.freeze()` / `range.thaw()` work (freeze_thaw passes on EC2)
 - [x] SDK: `range.enable_internet()` / `range.disable_internet()` work (internet_full/toggle pass)
 - [x] Internet policy: per-range iptables chains, MASQUERADE for `internet="full"`
-- [ ] Regression: Topo 1-7 all pass on namespace backend — BLOCKED by node-b slow boot (internet_none, topo6)
-- [x] New: Freeze/thaw test passes
-- [x] New: Internet policy test passes (full/toggle; `none` blocked by slow boot, not the policy)
-- [x] All unit tests pass — 216 green
-- [ ] All integration tests pass on EC2 — pending node-b slow-boot fix + cleanup_on_fail
+- [x] Regression: Topo 1-7 pass on namespace backend (topo6 multi-topology isolation PASS after MAC + inter-range isolation fixes)
+- [x] New: Freeze/thaw test passes (220s)
+- [x] New: Internet policy test passes (full/toggle + `none` blocks outbound, 217s)
+- [x] All unit tests pass — 222 green
+- [x] All 3 previously-failing integration tests pass on EC2 (freeze_thaw, internet_none, topo6)

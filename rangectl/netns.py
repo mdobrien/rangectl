@@ -74,6 +74,24 @@ def _iptables_forward_accept(subnet: str) -> None:
         _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
 
 
+def _ensure_mgmt_isolation() -> None:
+    """Block forwarding *between* ranges' management veths.
+
+    ``ip_forward=1`` (needed for internet=full MASQUERADE) otherwise lets the
+    host route packets from one range's mgmt subnet to another's, because the
+    host carries an on-link ``.254`` address on every range's host-side veth
+    (``mgh<hash>``). The per-subnet ACCEPT rules above would then permit the
+    cross-range hop. A single DROP for ``mgh+ -> mgh+`` closes that path while
+    leaving host<->range and range->internet (``-o <uplink>``) untouched.
+
+    Kept at the very top of FORWARD (delete-then-insert avoids duplicates and
+    re-promotes it above the per-subnet ACCEPTs every range adds). It is a
+    shared, range-agnostic rule, so teardown deliberately leaves it in place."""
+    rule = ["-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
+    _run(["iptables", "-D", "FORWARD", *rule], check=False)
+    _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
+
+
 def create_mgmt_network(netns_name: str, mgmt_subnet: str,
                         range_name: str) -> MgmtNetwork:
     """Create the mgmt bridge in ``netns_name``, link it to the host via a veth
@@ -98,6 +116,9 @@ def create_mgmt_network(netns_name: str, mgmt_subnet: str,
     _run(["ip", "addr", "add", f"{host_ip}/{prefix}", "dev", veth_host])
 
     _iptables_forward_accept(mgmt_subnet)
+    # Re-assert inter-range isolation last, so its DROP sits above the per-subnet
+    # ACCEPTs this range (and every other range) inserts.
+    _ensure_mgmt_isolation()
 
     return MgmtNetwork(
         bridge_name=MGMT_BRIDGE,

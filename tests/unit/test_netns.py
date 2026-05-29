@@ -96,12 +96,38 @@ def test_create_mgmt_network_installs_iptables_forward_accept():
 
 def test_create_mgmt_network_iptables_idempotent():
     with patch("rangectl.netns._run") as run:
-        # -C returns 0 (rule already present) → no -I insert.
+        # -C returns 0 (rule already present) → no per-subnet ACCEPT insert.
         run.return_value = _ok(rc=0)
         netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
     inserts = [c for c in cmds if c[:3] == ["iptables", "-I", "FORWARD"]]
-    assert inserts == []
+    # The per-subnet ACCEPTs are skipped (already present), but the inter-range
+    # isolation DROP is always re-inserted (delete-then-insert by design).
+    assert inserts == [["iptables", "-I", "FORWARD", "1",
+                        "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]]
+
+
+def test_create_mgmt_network_installs_inter_range_isolation_drop():
+    """A DROP for mgh+ -> mgh+ must be re-asserted at the top of FORWARD, after
+    the per-subnet ACCEPTs, so cross-range mgmt routing is blocked."""
+    with patch("rangectl.netns._run") as run:
+        # iptables -C returns non-zero (rule absent) so ACCEPTs insert; every
+        # other command (ip link, etc.) succeeds.
+        def side_effect(cmd, **kw):
+            if cmd[:3] == ["iptables", "-C", "FORWARD"]:
+                return _ok(rc=1)
+            return _ok()
+        run.side_effect = side_effect
+        netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
+    cmds = _cmds(run)
+    drop_del = ["iptables", "-D", "FORWARD", "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
+    drop_ins = ["iptables", "-I", "FORWARD", "1", "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
+    assert drop_del in cmds and drop_ins in cmds
+    # DROP insert must come after the subnet ACCEPT inserts (so it lands on top).
+    accept_idx = max(i for i, c in enumerate(cmds)
+                     if c[:4] == ["iptables", "-I", "FORWARD", "1"]
+                     and "ACCEPT" in c)
+    assert cmds.index(drop_ins) > accept_idx
 
 
 def test_create_mgmt_network_distinct_per_range():
