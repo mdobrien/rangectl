@@ -19,10 +19,11 @@ users:
   - name: {user}
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    lock_passwd: true
+    lock_passwd: false
+    plain_text_passwd: rangectl
     ssh_authorized_keys:
       - {ssh_pubkey}
-ssh_pwauth: false
+ssh_pwauth: true
 """
 
 
