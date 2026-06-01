@@ -163,14 +163,15 @@ class StateDB:
             self._conn.commit()
 
     def save_node(self, topology_name: str, name: str, image: str, vcpu: int,
-                  memory_mb: int, os_type: str, state: str, mgmt_ip: str | None = None) -> None:
+                  memory_mb: int, os_type: str, state: str,
+                  mgmt_ip: str | None = None, vm_id: str | None = None) -> None:
         log.info("Saving node '%s/%s' (state=%s)", topology_name, name, state)
         with self._lock:
             self._conn.execute(
                 "INSERT OR REPLACE INTO nodes "
-                "(topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (topology_name, name, image, vcpu, memory_mb, os_type, state, mgmt_ip),
+                "(topology_name, name, vm_id, image, vcpu, memory_mb, os_type, state, mgmt_ip) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (topology_name, name, vm_id, image, vcpu, memory_mb, os_type, state, mgmt_ip),
             )
             self._conn.commit()
 
@@ -206,6 +207,14 @@ class StateDB:
             params.append(level)
         query += " ORDER BY id ASC"
         cur = self._conn.execute(query, params)
+        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
+    def list_nodes(self, topology_name: str) -> list[dict]:
+        log.info("Listing nodes for topology '%s'", topology_name)
+        cur = self._conn.execute(
+            "SELECT * FROM nodes WHERE topology_name=? ORDER BY id ASC",
+            (topology_name,),
+        )
         return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
     def get_topology(self, name: str) -> dict | None:

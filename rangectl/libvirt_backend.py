@@ -184,6 +184,30 @@ class LibvirtBackend:
                     )
             return self._topo_keys[topology_name][0]
 
+    def reconnect_vm(self, vm_id: str, topology_name: str, mgmt_ip: str,
+                     ssh_user: str = "ubuntu",
+                     ssh_password: str | None = None) -> None:
+        """Re-populate the SSH bookkeeping for an already-running VM without
+        re-creating it. Used by Range.connect() to make exec()/upload() work
+        against a range deployed in an earlier process.
+
+        The per-topology keypair is loaded eagerly when present; if it's not on
+        disk (e.g. in unit tests) we tolerate it — _ssh_client() reconstructs it
+        lazily at exec time and will surface a clear error then.
+        """
+        log.info("reconnect_vm: %s (topo=%s, mgmt_ip=%s, user=%s)",
+                 vm_id, topology_name, mgmt_ip, ssh_user)
+        with self._lock:
+            self._vm_mgmt_ip[vm_id] = mgmt_ip
+            self._vm_ssh_user[vm_id] = ssh_user
+            self._vm_topo[vm_id] = topology_name
+            self._vm_ssh_password[vm_id] = ssh_password
+        try:
+            self._priv_key_for(topology_name)
+        except RuntimeError as exc:
+            log.warning("reconnect_vm: ssh key for %s not yet available (%s); "
+                        "will retry at exec time", topology_name, exc)
+
     def prepare_vyos_bootstrap(self, vm_id: str, ifaces: list[dict],
                                 ssh_pubkey: str, host_ip: str) -> None:
         """Register VyOS first-boot config to be applied via serial console.

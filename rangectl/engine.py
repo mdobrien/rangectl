@@ -565,7 +565,8 @@ class Engine:
         backend.attach_interface(vm_id, mgmt_bridge,
                                  _mac_for(topology.name, node.name, "mgmt"))
 
-        # Update DB row with mgmt_ip.
+        # Update DB row with mgmt_ip + the virsh domain name (vm_id), so a later
+        # process can reconnect via Range.connect().
         self._db.save_node(
             topology_name=topology.name,
             name=node.name,
@@ -575,6 +576,7 @@ class Engine:
             os_type=node.os_type.value,
             state=node.state.value,
             mgmt_ip=mgmt_ip,
+            vm_id=vm_id,
         )
 
         node.state = transition_node_state(node.state, NodeState.READY)
@@ -611,15 +613,19 @@ class Engine:
         cb.attach_interface(vm_id, mgmt_bridge,
                             _mac_for(topology.name, node.name, "mgmt"))
 
+        # Persist os_type="container" (not the guest OS) so reconnect can tell
+        # container nodes from VMs and pick the ContainerBackend. vm_id is the
+        # docker container name.
         self._db.save_node(
             topology_name=topology.name,
             name=node.name,
             image=node.container,
             vcpu=node.vcpu,
             memory_mb=node.memory,
-            os_type=node.os_type.value,
+            os_type="container",
             state=node.state.value,
             mgmt_ip=mgmt_ip,
+            vm_id=vm_id,
         )
         node.state = transition_node_state(node.state, NodeState.READY)
         self._db.update_node_state(topology.name, node.name, node.state.value)

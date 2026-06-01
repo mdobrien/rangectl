@@ -12,6 +12,19 @@ class CycleError(Exception):
     pass
 
 
+class RangeNotRunning(Exception):
+    """Raised by Range.connect() when a range's persisted state exists but the
+    range is not actually running (dead libvirtd, missing netns/socket, or no
+    such topology in the state DB)."""
+
+    def __init__(self, name: str, reason: str = "") -> None:
+        self.name = name
+        msg = f"range '{name}' is not running"
+        if reason:
+            msg += f": {reason}"
+        super().__init__(msg)
+
+
 class NodeState(Enum):
     DEFINED = "defined"
     PROVISIONING = "provisioning"

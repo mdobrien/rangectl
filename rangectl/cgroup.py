@@ -105,6 +105,15 @@ def thaw(range_name: str) -> None:
     (_cgroup_path(range_name) / "cgroup.freeze").write_text("0")
 
 
+def is_frozen(range_name: str) -> bool:
+    """True if the range's cgroup freezer is engaged. False if no cgroup exists
+    (range never had resource limits, or was deployed without freeze support)."""
+    try:
+        return (_cgroup_path(range_name) / "cgroup.freeze").read_text().strip() == "1"
+    except OSError:
+        return False
+
+
 def write_pid(cgroup_path: str, pid: int) -> None:
     """Place ``pid`` into the cgroup so all of its descendants inherit it."""
     log.info("write_pid: %s -> %s", pid, cgroup_path)

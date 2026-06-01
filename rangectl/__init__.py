@@ -3,7 +3,7 @@ from rangectl.cgroup import Resources
 from rangectl.dependencies import DependencySet
 from rangectl.images import ImageBuilder, ImageRegistry
 from rangectl.readiness import command_succeeds, ping, port_open, process_running
-from rangectl.types import ExecResult, InjectMethod, OSType
+from rangectl.types import ExecResult, InjectMethod, OSType, RangeNotRunning
 from rangectl.state import StateDB
 
 __all__ = [
@@ -19,6 +19,7 @@ __all__ = [
     "ExecResult",
     "InjectMethod",
     "OSType",
+    "RangeNotRunning",
     "StateDB",
     "port_open",
     "ping",

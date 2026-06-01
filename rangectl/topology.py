@@ -1,19 +1,58 @@
 from __future__ import annotations
+import json
 import logging
 import os
 import tempfile
+from pathlib import Path
 from typing import Any
 
+from rangectl import cgroup, supervisor
 from rangectl.dependencies import DependencyMixin
 from rangectl.types import (
     ExecResult,
     InterfaceSpec,
     NodeState,
     OSType,
+    RangeNotRunning,
     ReadinessProbe,
 )
 
 log = logging.getLogger(__name__)
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with this PID exists (signal 0 = existence check)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by another user — still alive.
+        return True
+
+
+def _netns_exists(netns_name: str) -> bool:
+    return Path(f"/run/netns/{netns_name}").exists()
+
+
+def _read_range_json(name: str, range_dir: str) -> dict | None:
+    p = Path(range_dir) / name / "range.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text())
+
+
+def _range_status(name: str, range_dir: str) -> str:
+    """Liveness classification for a persisted range: 'running', 'frozen', or
+    'orphaned' (state exists but the libvirtd/netns are gone)."""
+    info = _read_range_json(name, range_dir)
+    if (info is None or not _pid_alive(info["pid"])
+            or not _netns_exists(info["netns_name"])):
+        return "orphaned"
+    if cgroup.is_frozen(name):
+        return "frozen"
+    return "running"
 
 
 class Topology:
@@ -294,10 +333,15 @@ class Range:
     """
 
     def __init__(self, topology: Topology, internet: str = "none",
-                 resources: Any = None) -> None:
+                 resources: Any = None, persistent: bool = False) -> None:
         self.topology = topology
         self.internet = internet
         self.resources = resources
+        # Persistent ranges (reconnected via Range.connect()) survive __exit__ —
+        # leaving the `with` block disconnects rather than tearing the range
+        # down. Ephemeral ranges (the default, returned by deploy()) auto-destroy
+        # on exit, preserving the existing context-manager contract.
+        self._persistent = persistent
         self._nodes: dict[str, LiveNode] = {}
         self._engine: Any = None
         self._db: Any = None
@@ -311,11 +355,170 @@ class Range:
         return self
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._persistent:
+            log.info("Range context exiting, leaving persistent range '%s' running",
+                     self.topology.name)
+            return
         log.info("Range context exiting, destroying topology '%s'", self.topology.name)
+        self.destroy()
+
+    def destroy(self) -> None:
+        """Tear down the range — stop/undefine VMs, remove namespace/bridges,
+        free state. Works on both deployed and reconnected ranges."""
         if self._engine is not None:
             self._engine.destroy(self.topology)
         else:
             self.topology.destroy()
+
+    # --- persistent-range reconnect (Phase 13) ----------------------------
+
+    @classmethod
+    def connect(cls, name: str, db_path: str | None = None,
+                range_dir: str | None = None) -> "Range":
+        """Reconnect to a range deployed by an earlier process.
+
+        Rebuilds the per-range backends, LiveNode handles, and an ns-mode
+        Engine from persisted state (StateDB + range.json), so exec/upload/
+        snapshot/restore/destroy all work cross-process. Raises
+        ``RangeNotRunning`` if the topology is unknown/destroyed or its
+        libvirtd/netns/socket are gone.
+        """
+        from rangectl.container_backend import ContainerBackend
+        from rangectl.engine import Engine
+        from rangectl.libvirt_backend import LibvirtBackend
+        from rangectl.state import StateDB
+
+        rdir = range_dir or supervisor.DEFAULT_RANGE_DIR
+        db = StateDB(db_path)
+        try:
+            topo_row = db.get_topology(name)
+            if topo_row is None or topo_row["status"] == "destroyed":
+                raise RangeNotRunning(name, "no such running range in state DB")
+
+            info = _read_range_json(name, rdir)
+            if info is None:
+                raise RangeNotRunning(name, f"range.json missing under {rdir}/{name}")
+            if not _pid_alive(info["pid"]):
+                raise RangeNotRunning(name, f"libvirtd pid {info['pid']} is not alive")
+            if not _netns_exists(info["netns_name"]):
+                raise RangeNotRunning(name, f"netns {info['netns_name']} is gone")
+            if not Path(info["libvirt_socket"]).exists():
+                raise RangeNotRunning(
+                    name, f"libvirt socket {info['libvirt_socket']} missing")
+        except BaseException:
+            db.close()
+            raise
+
+        node_rows = db.list_nodes(name)
+        has_containers = any(r["os_type"] == "container" for r in node_rows)
+
+        # Per-range backends bound to the range's libvirt socket + netns.
+        lvb = LibvirtBackend(libvirt_socket=info["libvirt_socket"],
+                             netns_name=info["netns_name"])
+        cb = ContainerBackend(netns_name=info["netns_name"]) if has_containers else None
+
+        # Rebuild a Topology with Node objects so engine.destroy() can iterate
+        # nodes and route each to the right backend (VM vs container).
+        topology = Topology(name, backend=lvb, db=db, container_backend=cb)
+        for r in node_rows:
+            if r["os_type"] == "container":
+                topology.node(r["name"], container=r["image"],
+                              vcpu=r["vcpu"], memory=r["memory_mb"])
+            else:
+                topology.node(r["name"], image=r["image"], vcpu=r["vcpu"],
+                              memory=r["memory_mb"], os=r["os_type"])
+
+        # Rebuild an ns-mode Engine with the bookkeeping destroy() relies on.
+        engine = Engine(lvb, db, container_backend=cb, use_namespaces=True)
+        engine._range_info[name] = supervisor.RangeInfo(
+            name=name, pid=info["pid"], netns_name=info["netns_name"],
+            libvirt_socket=info["libvirt_socket"], mgmt_subnet=info["subnet"],
+            veth_host=info["veth_host"], veth_ns=info["veth_ns"],
+        )
+        engine._range_backends[name] = lvb
+        if cb is not None:
+            engine._range_container_backends[name] = cb
+        engine._link_bridges[name] = []
+
+        rng = cls(topology, persistent=True)
+        rng._engine = engine
+        rng._db = db
+        rng._backend = lvb
+        rng._mgmt_subnet = info["subnet"]
+        rng._veth_host = info["veth_host"]
+        topology._engine = engine
+
+        for r in node_rows:
+            vm_id = r["vm_id"] or f"{name}-{r['name']}"
+            mgmt_ip = r["mgmt_ip"]
+            engine._vm_ids[(name, r["name"])] = vm_id
+            engine._mgmt_ips[(name, r["name"])] = mgmt_ip
+            if r["os_type"] == "container":
+                backend: Any = cb
+            else:
+                backend = lvb
+                is_vyos = r["os_type"] == "vyos"
+                lvb.reconnect_vm(
+                    vm_id, name, mgmt_ip,
+                    ssh_user="vyos" if is_vyos else "ubuntu",
+                    ssh_password="vyos" if is_vyos else None,
+                )
+            rng._nodes[r["name"]] = LiveNode(
+                name=r["name"], mgmt_ip=mgmt_ip, topology_name=name,
+                backend=backend, vm_id=vm_id, db=db,
+            )
+
+        log.info("Reconnected to range '%s' (%d nodes)", name, len(node_rows))
+        return rng
+
+    @classmethod
+    def list(cls, db_path: str | None = None,
+             range_dir: str | None = None) -> list[dict]:
+        """All non-destroyed ranges with a liveness-checked status
+        ('running', 'frozen', or 'orphaned')."""
+        from rangectl.state import StateDB
+        rdir = range_dir or supervisor.DEFAULT_RANGE_DIR
+        db = StateDB(db_path)
+        try:
+            result = []
+            for topo in db.list_topologies():
+                if topo["status"] == "destroyed":
+                    continue
+                name = topo["name"]
+                result.append({
+                    "name": name,
+                    "status": _range_status(name, rdir),
+                    "node_count": len(db.list_nodes(name)),
+                    "mgmt_subnet": topo["mgmt_subnet"],
+                    "created_at": topo.get("created_at"),
+                })
+            return result
+        finally:
+            db.close()
+
+    @classmethod
+    def cleanup(cls, name: str, db_path: str | None = None,
+                range_dir: str | None = None) -> None:
+        """Force-remove an orphaned range's state when no live range remains:
+        kill any surviving libvirtd, tear down the netns + range dir + cgroup,
+        and clear the DB rows + mgmt subnet allocation."""
+        from rangectl.state import StateDB
+        rdir = range_dir or supervisor.DEFAULT_RANGE_DIR
+        log.info("Cleaning up range '%s'", name)
+        try:
+            supervisor.destroy_range(name, range_dir=rdir)
+        except Exception as exc:
+            log.warning("cleanup: destroy_range failed: %s", exc)
+        try:
+            cgroup.destroy_cgroup(name)
+        except Exception as exc:
+            log.warning("cleanup: destroy_cgroup failed: %s", exc)
+        db = StateDB(db_path)
+        try:
+            db.free_mgmt_subnet(name)
+            db.delete_topology(name)
+        finally:
+            db.close()
 
     def __getitem__(self, node_name: str) -> LiveNode:
         return self._nodes[node_name]
