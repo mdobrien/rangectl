@@ -206,27 +206,31 @@ class StateDB:
             query += " AND level=?"
             params.append(level)
         query += " ORDER BY id ASC"
-        cur = self._conn.execute(query, params)
-        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(query, params)
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
     def list_nodes(self, topology_name: str) -> list[dict]:
         log.info("Listing nodes for topology '%s'", topology_name)
-        cur = self._conn.execute(
-            "SELECT * FROM nodes WHERE topology_name=? ORDER BY id ASC",
-            (topology_name,),
-        )
-        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM nodes WHERE topology_name=? ORDER BY id ASC",
+                (topology_name,),
+            )
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
     def get_topology(self, name: str) -> dict | None:
         log.info("Getting topology '%s'", name)
-        cur = self._conn.execute("SELECT * FROM topologies WHERE name=?", (name,))
-        row = cur.fetchone()
-        return _row_to_dict(cur, row) if row else None
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM topologies WHERE name=?", (name,))
+            row = cur.fetchone()
+            return _row_to_dict(cur, row) if row else None
 
     def list_topologies(self) -> list[dict]:
         log.info("Listing all topologies")
-        cur = self._conn.execute("SELECT * FROM topologies ORDER BY name")
-        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM topologies ORDER BY name")
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
     def delete_topology(self, name: str) -> None:
         log.info("Deleting topology '%s' from DB", name)
@@ -257,19 +261,22 @@ class StateDB:
 
     def get_image(self, name: str) -> dict | None:
         log.info("Getting image '%s'", name)
-        cur = self._conn.execute("SELECT * FROM images WHERE name=?", (name,))
-        row = cur.fetchone()
-        return _row_to_dict(cur, row) if row else None
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM images WHERE name=?", (name,))
+            row = cur.fetchone()
+            return _row_to_dict(cur, row) if row else None
 
     def list_images(self) -> list[dict]:
         log.info("Listing all images")
-        cur = self._conn.execute("SELECT * FROM images ORDER BY name")
-        return [_row_to_dict(cur, row) for row in cur.fetchall()]
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM images ORDER BY name")
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
     def image_exists(self, name: str) -> bool:
         log.info("Checking image exists: '%s'", name)
-        cur = self._conn.execute("SELECT 1 FROM images WHERE name=?", (name,))
-        return cur.fetchone() is not None
+        with self._lock:
+            cur = self._conn.execute("SELECT 1 FROM images WHERE name=?", (name,))
+            return cur.fetchone() is not None
 
     def close(self) -> None:
         self._conn.close()
