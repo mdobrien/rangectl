@@ -665,7 +665,9 @@ class Range:
                 range_dir: str | None = None) -> None:
         """Force-remove an orphaned range's state when no live range remains:
         kill any surviving libvirtd, tear down the netns + range dir + cgroup,
-        and clear the DB rows + mgmt subnet allocation."""
+        reclaim the VM overlay/seed disk, and clear the DB rows + mgmt subnet
+        allocation."""
+        from rangectl.engine import cleanup_vm_storage
         from rangectl.state import StateDB
         rdir = range_dir or supervisor.DEFAULT_RANGE_DIR
         log.info("Cleaning up range '%s'", name)
@@ -677,6 +679,13 @@ class Range:
             cgroup.destroy_cgroup(name)
         except Exception as exc:
             log.warning("cleanup: destroy_cgroup failed: %s", exc)
+        # Reclaim overlay/seed disk (outside the range dir, so destroy_range
+        # doesn't touch it) — otherwise cleaning an orphan leaks exactly that
+        # disk. Best-effort; no-op if already gone.
+        try:
+            cleanup_vm_storage(name)
+        except Exception as exc:
+            log.warning("cleanup: vm storage failed: %s", exc)
         db = StateDB(db_path)
         try:
             db.free_mgmt_subnet(name)

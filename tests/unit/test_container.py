@@ -365,12 +365,13 @@ def test_engine_destroy_uses_per_node_backend(backend, db):
     engine = Engine(backend, db, container_backend=cb)
     engine.deploy(t)
     engine.destroy(t)
-    assert len(cb.calls_of("stop")) == 1
+    # Teardown force-destroys via each node's own backend; no graceful stop().
+    assert len(cb.calls_of("stop")) == 0
     assert len(cb.calls_of("destroy")) == 1
     # The VM half goes to libvirt backend
     vm_stops = [c for c in backend.calls if c[0] == "stop"]
     vm_destroys = [c for c in backend.calls if c[0] == "destroy"]
-    assert len(vm_stops) == 1
+    assert len(vm_stops) == 0
     assert len(vm_destroys) == 1
 
 

@@ -168,6 +168,20 @@ def test_destroy_calls_destroy_range(backend, db, ns):
     assert ns.destroyed == ["nsr"]
 
 
+def test_destroy_reaps_vms_via_pidns_not_per_vm(backend, db, ns):
+    """In ns mode, VM nodes are reaped by killing the range's libvirtd
+    (destroy_range), NOT by a slow per-VM `virsh destroy`/`stop`. Asserting no
+    per-VM destroy/stop locks in the perf fix (see deploy-performance analysis)."""
+    engine = Engine(backend, db, use_namespaces=True)
+    topo = _two_node_link_topo()
+    engine.deploy(topo)
+    ns.range_backend.calls.clear()
+    engine.destroy(topo)
+    assert ns.destroyed == ["nsr"]
+    assert ns.range_backend.calls_of("destroy") == []
+    assert ns.range_backend.calls_of("stop") == []
+
+
 def test_destroy_does_not_delete_bridges_directly(backend, db, ns):
     """Bridges live inside the netns; destroy_range cleans them, so the engine
     must not issue per-bridge delete calls in ns mode."""
@@ -196,10 +210,11 @@ def test_deploy_cleanup_on_fail_tears_down_range(backend, db, ns, monkeypatch):
     with pytest.raises(RuntimeError, match="timed out"):
         engine.deploy(topo)
 
-    # Per-range libvirtd/netns torn down (destroy_range called for this topo).
+    # Per-range libvirtd/netns torn down (destroy_range called for this topo) —
+    # this is what reaps the started VMs (PID-ns kill), so the engine does NOT
+    # issue a per-VM `virsh destroy` in ns mode.
     assert ns.destroyed == ["nsr"]
-    # VMs that were created get force-destroyed (overlay storage removed).
-    assert len(ns.range_backend.calls_of("destroy")) >= 1
+    assert ns.range_backend.calls_of("destroy") == []
     # mgmt subnet freed + topology row removed.
     assert db.get_topology("nsr") is None
 

@@ -48,6 +48,22 @@ SEED_ROOT = _state_root() / "seeds"
 MGMT_CIDR = "24"
 
 
+def cleanup_vm_storage(topology_name: str) -> None:
+    """Remove a range's VM overlays + seed ISOs (best-effort, no-op if absent).
+
+    These live under OVERLAY_ROOT/<topo> and SEED_ROOT/<topo>, OUTSIDE the range
+    dir, so neither destroy_range nor `virsh undefine --remove-all-storage` (which
+    ignores file-based disks not in a libvirt pool) ever reclaims them. Both the
+    normal teardown (Engine.destroy) and the orphan break-glass path
+    (Range.cleanup) call this so disk doesn't leak per range.
+    """
+    import shutil
+    for root in (OVERLAY_ROOT, SEED_ROOT):
+        d = root / topology_name
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _mac_for(topo_name: str, node_name: str, suffix: str) -> str:
     """Deterministic locally-administered MAC derived from names."""
     h = hashlib.sha1(f"{topo_name}/{node_name}/{suffix}".encode()).hexdigest()
@@ -213,10 +229,10 @@ class Engine:
 
     def _cleanup_failed_deploy(self, topology: Topology) -> None:
         """Best-effort teardown of a partially-deployed topology. Mirrors
-        ``destroy()`` but tolerates partial state. VMs are force-destroyed
-        (``--remove-all-storage``, so overlays don't leak) BEFORE the namespace
-        teardown, because ``destroy_range`` kills the per-range libvirtd the
-        destroy call needs to reach."""
+        ``destroy()`` but tolerates partial state. Uses the same fast path:
+        in namespace mode VM nodes are reaped by killing the range's libvirtd
+        (``_teardown_namespace``), so only containers are force-destroyed
+        per-node here; overlays/seed ISOs are cleaned afterwards."""
         log.warning("Deploy of '%s' failed; cleaning up partial state",
                     topology.name)
         for node in topology._nodes.values():
@@ -224,7 +240,7 @@ class Engine:
             if vm_id is None:
                 continue
             try:
-                self._backend_for(topology.name, node).destroy(vm_id)
+                self._teardown_node(topology, node, vm_id)
             except Exception as exc:
                 log.warning("cleanup: destroy VM %s failed: %s", vm_id, exc)
             self._vm_ids.pop((topology.name, node.name), None)
@@ -234,6 +250,11 @@ class Engine:
                 self._teardown_namespace(topology.name)
             except Exception as exc:
                 log.warning("cleanup: namespace teardown for %s failed: %s",
+                            topology.name, exc)
+            try:
+                cleanup_vm_storage(topology.name)
+            except Exception as exc:
+                log.warning("cleanup: vm storage for %s failed: %s",
                             topology.name, exc)
         else:
             for br in self._link_bridges.get(topology.name, []):
@@ -759,9 +780,7 @@ class Engine:
             except Exception:
                 node.state = NodeState.DESTROYING
             self._db.update_node_state(topology.name, node.name, node.state.value)
-            node_backend = self._backend_for(topology.name, node)
-            node_backend.stop(vm_id)
-            node_backend.destroy(vm_id)
+            self._teardown_node(topology, node, vm_id)
             node.state = transition_node_state(node.state, NodeState.DESTROYED)
             self._db.update_node_state(topology.name, node.name, node.state.value)
             self._vm_ids.pop((topology.name, node.name), None)
@@ -771,6 +790,11 @@ class Engine:
             # (reaping every QEMU child) and removes the netns, mgmt network,
             # data bridges (they live inside the netns), and range dir.
             self._teardown_namespace(topology.name)
+            # destroy_range reaps QEMU but does NOT delete the VM overlays/seed
+            # ISOs (they live outside the range dir, under OVERLAY_ROOT/SEED_ROOT,
+            # and virsh undefine --remove-all-storage never removed file-based
+            # disks anyway). Clean them explicitly so disk doesn't leak per range.
+            cleanup_vm_storage(topology.name)
         else:
             for br in self._link_bridges.get(topology.name, []):
                 self._backend.delete_bridge(br)
@@ -780,6 +804,27 @@ class Engine:
         self._db.free_mgmt_subnet(topology.name)
         self._db.delete_topology(topology.name)
         log.info("Destroy complete for '%s'", topology.name)
+
+    def _teardown_node(self, topology: Topology, node: Node, vm_id: str) -> None:
+        """Force-remove a single node's runtime.
+
+        We never issue a graceful stop() first — the node is discarded next, so an
+        ACPI shutdown only makes teardown poll `virsh domstate`, which BLOCKS
+        behind the guest's shutdown job (~80s/VM, serial).
+
+        In **namespace mode**, VM nodes are not destroyed per-VM at all: killing
+        the range's libvirtd (PID 1 of the range pid-ns) in `_teardown_namespace`
+        makes the kernel SIGKILL+reap every QEMU child in ~5s for the whole range
+        — vs a per-VM `virsh destroy`, which graceful-SIGTERMs QEMU and takes
+        ~80s/VM here. Containers are the exception: they're Docker processes, not
+        children of the range libvirtd, so destroy_range can't reap them — they
+        must be `docker rm -f`'d explicitly. In **legacy mode** there is no
+        per-range pid-ns to reap through, so every node is force-destroyed.
+        See scratch/issues/20260601-2-deploy-performance-analysis.md.
+        """
+        if self._use_namespaces and not node.is_container:
+            return  # reaped by _teardown_namespace (PID-ns kill)
+        self._backend_for(topology.name, node).destroy(vm_id)
 
     def _teardown_namespace(self, topology_name: str) -> None:
         """Tear down the range's namespaces + per-range libvirtd, then its

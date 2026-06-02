@@ -124,7 +124,9 @@ def test_destroy_cleans_up(backend, db):
     backend.calls.clear()
     engine.destroy(topo)
     names = [c[0] for c in backend.calls]
-    assert names.count("stop") == 2
+    # Teardown force-destroys; it must NOT issue a graceful stop() first (that
+    # only blocks on virsh domstate — see the deploy-performance analysis).
+    assert names.count("stop") == 0
     assert names.count("destroy") == 2
     # both topology bridge + mgmt bridge deleted
     assert names.count("delete_bridge") >= 2

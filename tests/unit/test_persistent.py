@@ -249,6 +249,31 @@ def test_cleanup_removes_state(state, monkeypatch):
         db.close()
 
 
+def test_cleanup_reclaims_overlay_and_seed_storage(state, monkeypatch, tmp_path):
+    """The orphan break-glass path must rmtree the range's overlay + seed dirs;
+    otherwise cleaning an orphan leaks exactly the disk we want reclaimed."""
+    from rangectl import engine as engine_mod
+
+    overlays = tmp_path / "overlays"
+    seeds = tmp_path / "seeds"
+    monkeypatch.setattr(engine_mod, "OVERLAY_ROOT", overlays)
+    monkeypatch.setattr(engine_mod, "SEED_ROOT", seeds)
+    (overlays / "orphan").mkdir(parents=True)
+    (overlays / "orphan" / "a.qcow2").write_text("disk")
+    (seeds / "orphan").mkdir(parents=True)
+    (seeds / "orphan" / "a.iso").write_text("seed")
+
+    monkeypatch.setattr(topo_mod.supervisor, "destroy_range",
+                        lambda name, range_dir=None: None)
+    monkeypatch.setattr(topo_mod.cgroup, "destroy_cgroup", lambda name: None)
+    state.seed("orphan")
+
+    Range.cleanup("orphan", db_path=state.db_file, range_dir=state.range_dir)
+
+    assert not (overlays / "orphan").exists()
+    assert not (seeds / "orphan").exists()
+
+
 # ---------- LibvirtBackend.reconnect_vm ----------
 
 def test_backend_reconnect_populates_ssh_state():

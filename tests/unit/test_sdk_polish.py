@@ -122,7 +122,7 @@ def test_range_context_manager(backend, db):
     with _Lab() as lab:
         lab.deploy(backend=backend, db=db)
         assert lab["a"].name == "a"
-    # exiting the block destroyed the range (engine.destroy issued stop/destroy).
+    # exiting the block destroyed the range (engine.destroy force-destroys).
     assert any(n == "destroy" for (n, _, _) in backend.calls)
 
 
