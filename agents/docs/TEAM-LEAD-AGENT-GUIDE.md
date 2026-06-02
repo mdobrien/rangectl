@@ -17,12 +17,13 @@ Read in order:
 1. `CLAUDE.md` — project rules, conventions
 2. `agents/docs/development-rules.md` — TDD workflow, code standards, test commands
 3. `agents/docs/ec2-usage.md` — how to manage the EC2 dev instance
-4. This guide — your workflow
-5. `scratch/issues/20260527-1-vm-testbed-platform-design.md` — **THE PLAN** (all phases)
-6. `scratch/issues/20260527-2-requirements-and-design-decisions.md` — requirements + decisions
-7. `scratch/issues/20260527-3-sdk-api-reference.md` — SDK API surface
-8. `scratch/issues/20260527-4-testing-strategy.md` — test topologies + gate definitions
-9. Your tracking file (if resuming) — current state, completed phases, key APIs
+4. `agents/docs/cli-reference.md` — `rangectl` CLI (day-2 ops on deployed ranges)
+5. This guide — your workflow
+6. `scratch/issues/20260527-1-vm-testbed-platform-design.md` — **THE PLAN** (all phases)
+7. `scratch/issues/20260527-2-requirements-and-design-decisions.md` — requirements + decisions
+8. `scratch/issues/20260527-3-sdk-api-reference.md` — SDK API surface
+9. `scratch/issues/20260527-4-testing-strategy.md` — test topologies + gate definitions
+10. Your tracking file (if resuming) — current state, completed phases, key APIs
 
 If resuming after compaction, your tracking file is your single source of truth.
 
@@ -165,7 +166,7 @@ Every kickoff must have:
 |---------|---------|
 | 1. Mission | 2-3 sentences: what to build |
 | 2. Current State | What exists in `rangectl/`, what SDK stubs are implemented |
-| 3. Critical Files | Ordered list: phase issue, development-rules.md, relevant SDK stubs, prior phase code |
+| 3. Critical Files | Ordered list: phase issue, development-rules.md, relevant SDK stubs, prior phase code. **Required reading** whenever the task touches the CLI or operates on running ranges (exec/inspect/power/destroy/snapshot): `agents/docs/cli-reference.md`. |
 | 4. Implementation Steps | Concise steps from the issue |
 | 5. TDD Workflow | Write unit tests first → red → implement → green → no regressions. Exact commands: `pytest tests/unit -x` |
 | 6. Integration Tests (Gate 2) | Which test topologies to run, how to push to EC2 and run remotely. Exact commands. |
@@ -264,6 +265,12 @@ Don't spawn Phase N+1 until Phase N is committed and verified. Phases build on e
 
 ### EC2 costs money
 Always stop the instance when not actively running integration tests. `scratch/scripts/ec2.sh stop` after each phase. Start it again when the next phase needs Gate 2.
+
+### Push back on shallow fixes — demand root causes
+When an agent reports a fix, verify it addresses the root cause, not a symptom. Shallow fixes compound: the Phase 12 destroy bug started as "cgroup rmdir fails with EBUSY" but the root cause was `destroy_range()` killing only the unshare wrapper, not libvirtd. Fixing rmdir retry logic would have masked the leaked processes, causing cascading SSH timeouts in later tests. Always ask: "why is this happening?" not "how do I make the error go away?"
+
+### Stuck agents — triage with a fresh agent, don't send more messages
+When an agent goes idle or seems to be spinning (retrying the same thing, not making progress), don't keep sending messages. Spawn a fresh agent to triage. The triage agent should read the actual code and git state (`git log`, `git diff`, the issue file) rather than trusting the stuck agent's summaries. Have the triage agent message the stuck agent to understand what happened, then take over.
 
 ## Common Pitfalls
 
