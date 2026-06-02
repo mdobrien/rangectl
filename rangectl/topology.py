@@ -864,6 +864,13 @@ class LiveNode:
         self.stop()
         self.start()
 
+    @property
+    def status(self) -> str:
+        """Power state of the node ('running', 'shut off', 'paused', ...)."""
+        if self._backend is None or self._vm_id is None:
+            raise RuntimeError(f"LiveNode {self.name!r} not bound to a backend")
+        return self._backend.status(self._vm_id)
+
     def exec(self, command: str) -> ExecResult:
         log.info("[%s/%s] exec: %s", self.topology_name, self.name, command)
         if self._backend is None or self._vm_id is None:

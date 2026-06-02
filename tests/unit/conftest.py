@@ -34,6 +34,7 @@ class MockBackend:
             available_memory_mb=32768,
             available_disk_mb=500_000,
         )
+        self.status_result = "running"
         self._next_vm_id = 0
         self._next_snap_id = 0
 
@@ -52,6 +53,10 @@ class MockBackend:
 
     def stop(self, vm_id: str) -> None:
         self._record("stop", vm_id)
+
+    def status(self, vm_id: str) -> str:
+        self._record("status", vm_id)
+        return self.status_result
 
     def destroy(self, vm_id: str) -> None:
         self._record("destroy", vm_id)

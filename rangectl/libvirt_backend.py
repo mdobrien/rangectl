@@ -429,6 +429,11 @@ class LibvirtBackend:
         res = _run(self._virsh("domstate", vm_id), check=False)
         return res.stdout.strip() if res.returncode == 0 else None
 
+    def status(self, vm_id: str) -> str:
+        """Public power state of a VM ('running', 'shut off', 'paused', ...).
+        Returns 'unknown' if the domain can't be queried."""
+        return self._dom_state(vm_id) or "unknown"
+
     # --- snapshots ---
 
     def snapshot(self, vm_id: str, name: str) -> str:
