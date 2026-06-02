@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pytest
 
 from rangectl import Topology
@@ -97,13 +100,62 @@ def test_deploy_two_nodes_with_link(backend, db):
     assert len(attaches) == 4
 
 
-def test_deploy_wave_ordering(backend, db):
+def test_boot_is_parallel_regardless_of_depends_on(backend, db):
+    """All nodes boot in one concurrent batch — boot has no cross-node
+    dependency, so even a depends_on chain must NOT serialize boot. Proven
+    by a 2-party barrier: if boot were wave-by-wave, only one node would reach
+    _deploy_node at a time and the barrier would time out (BrokenBarrierError)."""
     engine = Engine(backend, db)
+    barrier = threading.Barrier(2, timeout=5)
+    orig = engine._deploy_node
+
+    def spy(topology, node, *a, **k):
+        barrier.wait()  # both nodes must arrive together
+        return orig(topology, node, *a, **k)
+
+    engine._deploy_node = spy
+    engine.deploy(_dependency_chain_topo())  # raises if boot serialized
+
+
+def test_dependency_injection_follows_dag_order(backend, db):
+    """Dependency injection (Step 9) runs in compute_waves() order, so a
+    depends_on b's dependency a is injected before b."""
+    engine = Engine(backend, db)
+    order: list[str] = []
+    orig = engine._inject_dependencies
+
+    def spy(topology, node):
+        order.append(node.name)
+        return orig(topology, node)
+
+    engine._inject_dependencies = spy
     engine.deploy(_dependency_chain_topo())
-    # find create_vm call order — node a must precede node b
-    vm_specs = [c[1][0] for c in backend.calls if c[0] == "create_vm"]
-    names = [s.name for s in vm_specs]
-    assert names.index("chain-a") < names.index("chain-b")
+    assert order.index("a") < order.index("b")
+
+
+def test_boot_concurrency_cap_bounds_in_flight(backend, db):
+    """The boot semaphore caps concurrent _deploy_node calls. With 4 nodes and
+    a cap of 2, no more than 2 boots are ever in flight at once."""
+    t = Topology("capped")
+    for n in ("a", "b", "c", "d"):
+        t.node(n, image="ubuntu", vcpu=1, memory=1024)
+    engine = Engine(backend, db, boot_concurrency=2)
+    lock = threading.Lock()
+    state = {"inflight": 0, "peak": 0}
+    orig = engine._deploy_node
+
+    def spy(topology, node, *a, **k):
+        with lock:
+            state["inflight"] += 1
+            state["peak"] = max(state["peak"], state["inflight"])
+        time.sleep(0.05)
+        with lock:
+            state["inflight"] -= 1
+        return orig(topology, node, *a, **k)
+
+    engine._deploy_node = spy
+    engine.deploy(t)
+    assert state["peak"] == 2
 
 
 def test_deploy_assigns_mgmt_ips(backend, db):

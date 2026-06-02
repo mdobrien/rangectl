@@ -3,7 +3,7 @@ import hashlib
 import logging
 import os
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, Semaphore, Thread
 
 from rangectl import cgroup, internet, supervisor
 from rangectl.backend import Backend
@@ -91,10 +91,16 @@ class Engine:
                  container_backend: Backend | None = None,
                  use_namespaces: bool = False,
                  resources: Resources | None = None,
-                 internet: str = "none") -> None:
+                 internet: str = "none",
+                 boot_concurrency: int = 8) -> None:
         self._backend = backend
         self._container_backend = container_backend
         self._db = db
+        # Max VMs booted concurrently. Boot has no cross-node dependency, so all
+        # nodes boot in one batch — but a cap stops large ranges from thundering-
+        # herd the host (every VM reading the base image + cloud-init CPU spike at
+        # once inflated an observed boot 28s→145s). See 20260601-4.
+        self._boot_concurrency = boot_concurrency
         # When True, each range gets its own PID/net/mount namespaces and a
         # per-range libvirtd (see supervisor.py). VM and bridge ops route into
         # that namespace; bridge names become clean (mgmt-br, data-0, …). When
@@ -342,22 +348,29 @@ class Engine:
         # SSH/VyOS-bootstrap paths that run later on the same instance.
         ssh_pubkey = vm_backend.ssh_pubkey(topology.name)
 
-        log.info("Step 6: Compute waves")
+        log.info("Step 6: Compute waves (for dependency-injection ordering)")
         waves = self.compute_waves(topology)
 
-        log.info("Step 7: Deploy waves")
-        for i, wave in enumerate(waves):
-            log.info("Wave %d: %s", i + 1, [n.name for n in wave])
-            self._deploy_wave(topology, wave, mgmt_subnet, mgmt_bridge,
-                              ssh_pubkey, host_ip)
+        # Boot has no cross-node dependency — each node gets its full config from
+        # its own cloud-init seed ISO, and links are wired afterward (Step 8). So
+        # boot every node in one capped-parallel batch rather than wave-by-wave;
+        # the DAG is reserved for dependency injection (Step 9), where it matters.
+        log.info("Step 7: Boot all nodes (parallel)")
+        all_nodes = list(topology._nodes.values())
+        self._deploy_wave(topology, all_nodes, mgmt_subnet, mgmt_bridge,
+                          ssh_pubkey, host_ip)
 
         log.info("Step 8: Wire topology links (DB + attach for hot-attach back-ends)")
         for link_idx, link in enumerate(topology._links):
             self._wire_link(topology, link, link_idx)
 
-        log.info("Step 9: Run dependency injection")
-        for node in topology._nodes.values():
-            self._inject_dependencies(topology, node)
+        # Dependency injection IS order-sensitive ("B's service depends on A being
+        # ready"), so run it in DAG wave order.
+        log.info("Step 9: Run dependency injection (DAG wave order)")
+        for i, wave in enumerate(waves):
+            log.info("Dep-injection wave %d: %s", i + 1, [n.name for n in wave])
+            for node in wave:
+                self._inject_dependencies(topology, node)
 
         self._db.save_topology(
             name=topology.name, status="running",
@@ -426,14 +439,17 @@ class Engine:
                      ssh_pubkey: str, host_ip: str) -> None:
         threads: list[Thread] = []
         errors: list[BaseException] = []
+        # Cap concurrent boots so a large range doesn't thundering-herd the host.
+        sem = Semaphore(self._boot_concurrency)
 
         def _runner(n: Node) -> None:
-            try:
-                self._deploy_node(topology, n, mgmt_subnet, mgmt_bridge,
-                                  ssh_pubkey, host_ip)
-            except BaseException as exc:  # capture for join-time re-raise
-                with self._lock:
-                    errors.append(exc)
+            with sem:
+                try:
+                    self._deploy_node(topology, n, mgmt_subnet, mgmt_bridge,
+                                      ssh_pubkey, host_ip)
+                except BaseException as exc:  # capture for join-time re-raise
+                    with self._lock:
+                        errors.append(exc)
 
         for node in wave:
             t = Thread(target=_runner, args=(node,),
