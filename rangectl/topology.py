@@ -8,6 +8,7 @@ from typing import Any
 
 from rangectl import cgroup, supervisor
 from rangectl.dependencies import DependencyMixin
+from rangectl.drivers import make_driver
 from rangectl.types import (
     ExecResult,
     InterfaceSpec,
@@ -324,7 +325,15 @@ class Link:
 
 
 class Range:
-    """Live handle to a deployed topology. Returned by Topology.deploy().
+    """Two faces of the same object:
+
+    1. **Live handle** to a deployed topology, returned by ``Topology.deploy()``
+       and ``Engine.deploy()`` (constructed with an explicit ``topology``).
+    2. **Lifecycle base class** users subclass to declare infrastructure. The
+       subclass sets a ``name`` class attribute and overrides ``define_nodes``,
+       ``define_network``, ``install_software``, ``configure_os`` and (required)
+       ``verify``. Calling ``deploy()`` runs them in order, wiring the Engine /
+       backend / StateDB internally so users never touch them.
 
     ``internet`` is the outbound-internet policy ("none" or "full") and
     ``resources`` carries the cgroup limits the range was deployed with. Both
@@ -332,11 +341,34 @@ class Range:
     the freeze/thaw/internet controls raise if invoked.
     """
 
-    def __init__(self, topology: Topology, internet: str = "none",
+    # Overridable by subclasses (lifecycle API).
+    internet: str = "none"
+    resources: Any = None
+
+    def __init__(self, topology: Topology | None = None, internet: str | None = None,
                  resources: Any = None, persistent: bool = False) -> None:
+        if topology is None:
+            # Lifecycle (subclass) mode — build the internal Topology from the
+            # subclass's `name` class attribute. The engine/backend are created
+            # lazily in deploy().
+            if type(self) is Range:
+                raise TypeError(
+                    "Range() requires a topology; subclass Range to use the "
+                    "lifecycle API (define_nodes/define_network/verify)"
+                )
+            cls_name = getattr(type(self), "name", None)
+            if not cls_name or not isinstance(cls_name, str):
+                raise RuntimeError(
+                    f"{type(self).__name__} must set a class attribute "
+                    "name = '<range-name>'"
+                )
+            topology = Topology(cls_name)
+            self._lifecycle = True
+        else:
+            self._lifecycle = False
         self.topology = topology
-        self.internet = internet
-        self.resources = resources
+        self.internet = internet if internet is not None else type(self).internet
+        self.resources = resources if resources is not None else type(self).resources
         # Persistent ranges (reconnected via Range.connect()) survive __exit__ —
         # leaving the `with` block disconnects rather than tearing the range
         # down. Ephemeral ranges (the default, returned by deploy()) auto-destroy
@@ -350,6 +382,136 @@ class Range:
         # and internet controls know which cgroup / veth / subnet to act on.
         self._mgmt_subnet: str | None = None
         self._veth_host: str | None = None
+
+    # --- lifecycle API (override in subclasses) ---------------------------
+
+    @property
+    def name(self) -> str:
+        """Range name. A subclass overrides this with a string class attribute,
+        which shadows this property; the live-handle form falls back to the
+        topology name."""
+        return self.topology.name
+
+    def define_nodes(self) -> None:
+        """Declare nodes via ``self.node(...)``. Override in subclass."""
+
+    def define_network(self) -> None:
+        """Declare links via ``self.link(...)``. Override in subclass."""
+
+    def install_software(self) -> None:
+        """Install packages / services on live nodes. Override in subclass."""
+
+    def configure_os(self) -> None:
+        """Apply routes/sysctls/files on live nodes. Override in subclass."""
+
+    def verify(self) -> None:
+        """Assert the range is working. **Required** — deploy raises if not
+        overridden, forcing the author to define what 'working' means."""
+        raise NotImplementedError("verify() must be overridden")
+
+    def node(self, name: str, image: str | None = None,
+             os_type: OSType | str | None = None, **kwargs: Any) -> Node:
+        """Declare a node on the internal topology. Accepts ``os_type=`` (alias
+        for the topology's ``os=``) for readability."""
+        if os_type is not None:
+            kwargs["os"] = os_type
+        return self.topology.node(name, image=image, **kwargs)
+
+    def deploy(self, *, backend: Any = None, db: Any = None,
+               container_backend: Any = None, use_namespaces: bool | None = None,
+               cleanup_on_fail: bool = True) -> "Range":
+        """Stand up the lab. Runs the lifecycle in order:
+
+            define_nodes -> define_network -> boot (engine, DAG waves) ->
+            install_software -> configure_os -> verify -> READY
+
+        With no ``backend`` a real LibvirtBackend + StateDB are created and the
+        range runs in namespace mode. Tests inject a MockBackend + in-memory DB
+        (which disables namespace mode by default)."""
+        if not self._lifecycle:
+            raise RuntimeError(
+                "deploy() is only for Range subclasses; this is a live handle "
+                "(use Topology.deploy()/Engine.deploy() instead)"
+            )
+        if type(self).verify is Range.verify:
+            raise RuntimeError(
+                f"{type(self).__name__}.verify() must be overridden before deploy()"
+            )
+        from rangectl.engine import Engine
+
+        # 1. Declarative phase — populate the internal topology.
+        self.define_nodes()
+        self.define_network()
+
+        # 2. Resolve backends. Injected backend == test mode == no namespaces.
+        testing = backend is not None
+        if use_namespaces is None:
+            use_namespaces = not testing
+        if backend is None:
+            from rangectl.libvirt_backend import LibvirtBackend
+            backend = LibvirtBackend()
+        if db is None:
+            from rangectl.state import StateDB
+            db = StateDB()
+        has_containers = any(n.is_container for n in self.topology._nodes.values())
+        if has_containers and container_backend is None and not testing:
+            from rangectl.container_backend import ContainerBackend
+            container_backend = ContainerBackend()
+        self.topology._backend = backend
+        self.topology._db = db
+        self.topology._container_backend = container_backend
+
+        engine = Engine(backend, db, container_backend=container_backend,
+                        use_namespaces=use_namespaces, resources=self.resources,
+                        internet=self.internet)
+
+        # 3. Boot — engine handles cloud-init, SSH wait, DAG wave ordering.
+        rng = engine.deploy(self.topology, cleanup_on_fail=cleanup_on_fail)
+
+        # Absorb the live state into self — the lab IS the topology object.
+        self._nodes = rng._nodes
+        self._engine = engine
+        self._db = db
+        self._backend = rng._backend
+        self._mgmt_subnet = rng._mgmt_subnet
+        self._veth_host = rng._veth_host
+        self.topology._engine = engine
+        # Rebind user-held Node attributes (self.router, ...) to their LiveNodes
+        # so post-boot lifecycle hooks operate on live nodes.
+        self._rebind_live()
+
+        # 4. Post-boot lifecycle.
+        self.install_software()
+        self.configure_os()
+        self.verify()
+        log.info("Range '%s' READY", self.name)
+        return self
+
+    def _rebind_live(self) -> None:
+        for attr, val in list(self.__dict__.items()):
+            if isinstance(val, Node) and val.name in self._nodes:
+                setattr(self, attr, self._nodes[val.name])
+
+    # --- verify helpers (simple stubs that run real commands) -------------
+
+    def expect_reach(self, node: Any, dest: str, via: Any = None) -> None:
+        """Assert ``node`` can ping ``dest``. ``via`` is accepted for readability
+        but not used (the route must already exist)."""
+        live = node if isinstance(node, LiveNode) else self[node]
+        result = live.exec(f"ping -c 1 -W 2 {dest}")
+        if result.exit_code != 0:
+            raise AssertionError(
+                f"{live.name} cannot reach {dest}: {result.stderr.strip()}"
+            )
+
+    def __repr__(self) -> str:
+        cls = type(self).__name__
+        if self._nodes:
+            status, count = "RUNNING", len(self._nodes)
+        else:
+            status, count = "DEFINED", len(self.topology._nodes)
+        return (f'{cls}("{self.name}", status={status}, nodes={count}, '
+                f'internet={self.internet})')
 
     def __enter__(self) -> Range:
         return self
@@ -466,6 +628,8 @@ class Range:
             rng._nodes[r["name"]] = LiveNode(
                 name=r["name"], mgmt_ip=mgmt_ip, topology_name=name,
                 backend=backend, vm_id=vm_id, db=db,
+                os_type=r["os_type"],
+                ssh_user="vyos" if r["os_type"] == "vyos" else "ubuntu",
             )
 
         log.info("Reconnected to range '%s' (%d nodes)", name, len(node_rows))
@@ -523,12 +687,21 @@ class Range:
     def __getitem__(self, node_name: str) -> LiveNode:
         return self._nodes[node_name]
 
-    def link(self, node_a: str, node_b: str) -> Link:
-        log.info("Looking up link between %s and %s", node_a, node_b)
+    def link(self, a: Any, b: Any) -> Link:
+        """Two modes, picked by argument type:
+
+        - **define** (``InterfaceSpec`` args): create a link on the internal
+          topology — ``self.link(router.eth1["10.0.1.1/24"], t.eth1["10.0.1.2/24"])``.
+        - **lookup** (node-name strings): return the existing link between two
+          nodes for fault injection — ``lab.link("router", "target").down()``.
+        """
+        if isinstance(a, InterfaceSpec):
+            return self.topology.link(a, b)
+        log.info("Looking up link between %s and %s", a, b)
         for lnk in self.topology._links:
-            if {lnk.if_a.node_name, lnk.if_b.node_name} == {node_a, node_b}:
+            if {lnk.if_a.node_name, lnk.if_b.node_name} == {a, b}:
                 return lnk
-        raise KeyError(f"No link between {node_a} and {node_b}")
+        raise KeyError(f"No link between {a} and {b}")
 
     def snapshot(self, name: str) -> None:
         log.info("Snapshot all nodes in '%s': %s", self.topology.name, name)
@@ -610,13 +783,86 @@ class LiveNode:
 
     def __init__(self, name: str, mgmt_ip: str, topology_name: str,
                  backend: Any = None, vm_id: str | None = None,
-                 db: Any = None) -> None:
+                 db: Any = None, os_type: OSType | str = OSType.LINUX,
+                 ssh_user: str = "ubuntu") -> None:
         self.name = name
         self.mgmt_ip = mgmt_ip
         self.topology_name = topology_name
+        self.ssh_user = ssh_user
         self._backend = backend
         self._vm_id = vm_id
         self._db = db
+        # OS-specific operations (route, sysctl, packages, ...) route through
+        # this driver, which translates them to the right commands for the OS.
+        self._driver = make_driver(os_type, backend, vm_id)
+
+    def __repr__(self) -> str:
+        return (f'LiveNode("{self.name}", ip={self.mgmt_ip}, '
+                f'vm_id={self._vm_id})')
+
+    # --- command + file convenience (Phase 15) ----------------------------
+
+    def run(self, cmd: str, check: bool = True) -> str:
+        """Run ``cmd`` and return stdout. Raises on non-zero exit unless
+        ``check=False``. (``exec()`` returns the full ExecResult instead.)"""
+        result = self.exec(cmd)
+        if check and result.exit_code != 0:
+            raise RuntimeError(
+                f"command failed (exit {result.exit_code}) on {self.name}: "
+                f"{result.stderr.strip()}"
+            )
+        return result.stdout
+
+    def put(self, src: str, dst: str) -> None:
+        """Alias for ``upload`` — copy a single file to the node."""
+        self.upload(src, dst)
+
+    def put_dir(self, src: str, dst: str) -> None:
+        """Copy a directory tree to the node (via the OS driver)."""
+        self._driver.put_dir(src, dst)
+
+    # --- OS-abstracted operations (routed through the driver) -------------
+
+    def route(self, dest: str, via: str) -> None:
+        self._driver.add_route(dest, via)
+
+    def sysctl(self, key: str, value: Any) -> None:
+        self._driver.set_sysctl(key, value)
+
+    def packages(self, pkgs: list[str]) -> None:
+        self._driver.install_packages(pkgs)
+
+    def service(self, name: str, enabled: bool = True) -> None:
+        if enabled:
+            self._driver.enable_service(name)
+
+    def firewall_allow(self, port: int, proto: str = "tcp") -> None:
+        self._driver.firewall_allow(port, proto)
+
+    def check_port(self, port: int, host: str = "127.0.0.1") -> bool:
+        """Verify a TCP port is open on the node (stub used by verify())."""
+        result = self.exec(
+            f"bash -c 'exec 3<>/dev/tcp/{host}/{port}' 2>/dev/null")
+        if result.exit_code != 0:
+            raise AssertionError(
+                f"port {port} not open on {self.name} ({host})")
+        return True
+
+    # --- power operations -------------------------------------------------
+
+    def start(self) -> None:
+        if self._backend is None or self._vm_id is None:
+            raise RuntimeError(f"LiveNode {self.name!r} not bound to a backend")
+        self._backend.start(self._vm_id)
+
+    def stop(self) -> None:
+        if self._backend is None or self._vm_id is None:
+            raise RuntimeError(f"LiveNode {self.name!r} not bound to a backend")
+        self._backend.stop(self._vm_id)
+
+    def restart(self) -> None:
+        self.stop()
+        self.start()
 
     def exec(self, command: str) -> ExecResult:
         log.info("[%s/%s] exec: %s", self.topology_name, self.name, command)

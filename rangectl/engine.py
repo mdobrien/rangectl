@@ -347,6 +347,8 @@ class Engine:
         rng = Range(topology, internet=self._internet, resources=self._resources)
         for node in topology._nodes.values():
             mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
+            is_vyos = node.os_type == OSType.VYOS
+            os_type = "container" if node.is_container else node.os_type
             rng._nodes[node.name] = LiveNode(
                 name=node.name,
                 mgmt_ip=mgmt_ip,
@@ -354,6 +356,8 @@ class Engine:
                 backend=self._backend_for(topology.name, node),
                 vm_id=self._vm_ids[(topology.name, node.name)],
                 db=self._db,
+                os_type=os_type,
+                ssh_user="vyos" if is_vyos else "ubuntu",
             )
         rng._engine = self
         rng._db = self._db

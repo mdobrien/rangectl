@@ -72,6 +72,15 @@ class OSType(Enum):
     LINUX = "linux"
     WINDOWS = "windows"
     VYOS = "vyos"
+    CONTAINER = "container"
+
+    @classmethod
+    def register(cls, name: str, driver_cls) -> None:
+        """Register a custom OS driver so nodes of this type get OS-specific
+        behaviour (route, sysctl, ...). ``name`` is the os_type string used at
+        node declaration / in the state DB."""
+        from rangectl.drivers import register_driver
+        register_driver(name, driver_cls)
 
 
 @dataclass
