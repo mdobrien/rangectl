@@ -44,6 +44,20 @@ node). `exec` passes through the **remote command's** exit code.
 | `cleanup <range>` | force-remove orphaned state |
 | `images {list, add <name> <path> [--inject M] [--os-type T], remove <name>, info <name>}` | StateDB image registry |
 
+## Teardown / cleanup (range-scoped — read this)
+
+To kill a range, use the CLI: `rangectl destroy <range>` (idempotent — falls
+back to `cleanup` if already gone) or `rangectl cleanup <range>` for orphans.
+Both are **range-scoped**: they kill only that range's libvirtd wrapper PID
+(from `range.json`) + cgroup; the kernel reaps that range's QEMU. `destroy
+--all` does this per range.
+
+**NEVER** clean up with host-wide kills — `pkill -f qemu-system`,
+`pkill -f libvirtd`, blanket `ip netns del` loops. They reach across ranges and
+SIGTERM other agents' VMs mid-deploy (this happened: a blanket pkill in a test
+pre-clean killed a concurrent benchmark range). Tests/scripts must tear down
+their **own** range by name via the CLI.
+
 ## Gotchas
 
 - `arg ranges/nodes` resolve via the default DB — wrong host = "not found".

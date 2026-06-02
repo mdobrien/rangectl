@@ -115,11 +115,8 @@ def test_cli_full_lifecycle(default_db_with_images):
         assert r.returncode == 0, r.stderr
         assert RANGE_NAME not in r.stdout
     finally:
-        # Ensure no leak if an assertion failed before destroy().
-        try:
-            Range.connect(RANGE_NAME).destroy()
-        except Exception:
-            try:
-                Range.cleanup(RANGE_NAME)
-            except Exception:
-                pass
+        # Ensure no leak if an assertion failed before destroy(). Use the CLI
+        # itself — `destroy` is idempotent and range-scoped (falls back to
+        # `cleanup` if the range is already gone). NEVER blanket-pkill qemu/
+        # libvirtd here: that reaches across ranges and kills other agents' VMs.
+        _cli("destroy", RANGE_NAME)
