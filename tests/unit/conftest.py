@@ -111,6 +111,25 @@ class MockBackend:
         return [(a, k) for (n, a, k) in self.calls if n == name]
 
 
+@pytest.fixture(autouse=True)
+def _isolate_state_roots(tmp_path, monkeypatch):
+    """Keep unit tests off the real global seed/overlay dirs.
+
+    The engine writes seed ISOs + overlays under engine.SEED_ROOT/OVERLAY_ROOT —
+    real paths (/var/lib/libvirt/images/rangectl or ~/.rangectl) keyed only by
+    range name. Without isolation a deploy/destroy test touches global state, so
+    concurrent runs (or two agents on one box) collide on the same path — e.g.
+    FileExistsError on .../seeds/<range>. Redirect both roots to a per-test
+    tmp_path. The engine reads them as module globals at call time, so patching
+    the module attrs is sufficient. Tests that set their own roots still win:
+    they share this function-scoped monkeypatch and run after the autouse fixture,
+    so their setattr is applied last.
+    """
+    from rangectl import engine as engine_mod
+    monkeypatch.setattr(engine_mod, "SEED_ROOT", tmp_path / "seeds")
+    monkeypatch.setattr(engine_mod, "OVERLAY_ROOT", tmp_path / "overlays")
+
+
 @pytest.fixture
 def backend() -> MockBackend:
     return MockBackend()
