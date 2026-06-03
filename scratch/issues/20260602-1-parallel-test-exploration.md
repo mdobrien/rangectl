@@ -429,10 +429,32 @@ Run via `iso-concurrent-run.sh` after the fixes:
   pytest-timeout** (teardown runs) + bounded `-n 4` to avoid both the herd and
   the leak. Manually reaped A's orphans via SIGTERM to the pid-ns inits.
 
-### Gate 2 checkpoint C (real acceptance: `pytest -n 4 --dist loadfile`) — IN PROGRESS
-Bounded 4-way concurrency (≈10–15 VMs peak) with the boot stagger; mid-run host
-showed distinct registry subnets and 1 route per /24. Result + final leak
-inventory to be appended.
+### Gate 2 checkpoint C — second root cause found: legacy-mode data-plane collision
+The first `-n 4` attempt still failed several tests + piled up ranges. Diagnosed
+to TWO further causes the mgmt-subnet fix didn't cover:
+
+1. **topo1-7 ran in LEGACY mode.** Bare `topo.deploy()` defaulted to
+   `use_namespaces=False` → host-level networking with NO data-plane isolation.
+   topo1 and topo2 both use `10.0.1.0/24`; run concurrently they collide on the
+   shared host stack. (Namespace mode isolates data subnets via netns — proven
+   by `test_ns_multi_range_isolation`, two ranges on identical `10.0.9.0/24`.)
+   **Fix:** `Topology.deploy` now defaults `use_namespaces=True` (commit
+   `4f5eaf4`); legacy is explicit opt-in. All integration topo tests now exercise
+   the production namespace path. MockBackend unit tests pass
+   `use_namespaces=False` explicitly.
+2. **A hardcoded mgmt-subnet assertion.** `test_topo2.py:52` asserted the router
+   had `192.168.100.1/24` — but the registry (correctly) hands concurrent ranges
+   `.101`, `.102`, … So topo2 passed solo (drew `.100`) but failed whenever
+   another range held `.100`. **Fix:** derive the expected IP from
+   `rng["router"].mgmt_ip`. Also broadened the conftest NAT MASQUERADE from
+   `192.168.100.0/24` to the whole pool (`192.168.0.0/16`).
+
+Verified: `topo1`+`topo2` (both `10.0.1.0/24`) now **pass concurrently** at
+`-n 2` after these fixes. `xdist` itself works fine on Ubuntu 22.04 — the `-n 2`
+run distributed files and tore down each range cleanly (registry frees logged);
+an earlier `INTERNALERROR` was a `/tmp`-rootdir artifact, not an xdist bug.
+
+Full `-n 4 --dist loadfile` acceptance result to be appended.
 
 ### Notes / follow-ups
 - **Legacy-mode disk leak** (overlay/seed dirs for `topo1-7` not reclaimed):
