@@ -25,11 +25,14 @@ heavy DB) so that `pytest -n 4 tests/integration/` "just works". Also verify the
   (true concurrency), `timeout 900` each, then a host leak inventory.
   Harness: `scratch/scripts/iso-concurrent-run.sh`.
 - Baseline: `test_topo1.py` alone, serial → **PASS in 38s** (env is healthy).
-- xdist path: **unavailable** — EC2's pip index maxes at `pytest-xdist 1.24.1`,
-  which doesn't register `-n` under pytest 9 (`error: unrecognized arguments: -n 2`).
-  Background-process concurrency is the stand-in and is actually a *stronger*
-  test (separate processes = separate StateDBs, exactly the production-like
-  per-DB allocation that collides).
+- xdist path at this point: the **installed** `pytest-xdist` was `1.24.1`, which
+  doesn't register `-n` under pytest 9 (`error: unrecognized arguments: -n 2`).
+  (CORRECTION — later disproven: PyPI has `pytest-xdist 3.8.0` and it installs +
+  works fine on this box; the "index maxes at 1.24.1" assumption was wrong, it was
+  just the stale *installed* version. See Implementation Log / Fix 5.)
+  Background-process concurrency was used here as the stand-in and is actually a
+  *stronger* test (separate processes = separate StateDBs, exactly the
+  production-like per-DB allocation that collides).
 
 ## Phase 1 — Inventory (collision surface)
 
@@ -223,7 +226,10 @@ read-lock issue (`20260601-3`).
 - Subnet allocator IS correct **when all ranges share one DB** — `mgmt_subnets`
   PK + first-free scan hands out `.100`,`.101`,… with no overlap.
 
-**What breaks concurrency — entirely test-infra, one root cause:**
+**What breaks concurrency — test-infra. (NOTE: this section originally said "one
+root cause"; that undercounted. The mgmt-subnet collision below is the dominant
+one, but implementation surfaced a SECOND: legacy-mode data-plane collision —
+see Implementation Log / checkpoint C. Both are now fixed.)**
 - The integration `db` fixture gives every test its **own temp StateDB**. The
   subnet pool lives *in that DB*, so N concurrent tests each see an empty pool
   and all grab `.100.0`. Everything downstream (guest IPs, host route, `.254`
@@ -350,27 +356,42 @@ Rule of thumb: **unit-test every fix (per-commit Gate 1); spend Gate 2 only at A
 B, C.** A and B reuse the two harness scripts already committed in this issue.
 
 ## Resolution
-Two independent concurrency problems, both lightweight to fix:
+> **This was the ANALYSIS-phase resolution. It was later partly superseded —
+> it undercounted (THREE problems, not two) and the "analysis only / no code
+> changed" line is no longer true (the fixes were implemented). Read the
+> Implementation Log + Handoff for the actual outcome.** Kept for the record:
 
-1. **Test-infra (the parallel-suite blocker):** per-test temp StateDBs each
-   allocate the same `192.168.100.0/24`, so concurrent ranges collide on guest
-   IPs + host routes → mode A (flaky `ssh ... Authentication failed`) and mode B
-   (false `ISOLATION BREACH` in topo6). ~12/24 tests failed concurrently, and
-   *which* ones is race-dependent. Keystone fix: a host-global, flock-guarded
-   subnet allocator (~0.5d); name-prefix + seed-root + DROP-unify + xdist round
-   it out.
+Concurrency problems found (the analysis named the first two; implementation
+surfaced the third):
 
-2. **Product (surfaced by Phase 6):** three StateDB write methods
+1. **Test-infra — mgmt-subnet collision (the parallel-suite blocker):** per-test
+   temp StateDBs each allocate the same `192.168.100.0/24`, so concurrent ranges
+   collide on guest IPs + host routes → mode A (flaky `ssh ... Authentication
+   failed`) and mode B (false `ISOLATION BREACH` in topo6). ~12/24 tests failed
+   concurrently, race-dependent. Fix: host-global flock subnet allocator.
+
+2. **Product — StateDB write-lock:** three write methods
    (`delete_topology`/`add_image`/`remove_image`) skip `self._lock`, so
    thread-parallel multi-range from one process crashes with `cannot start a
-   transaction within a transaction`. The subnet allocator itself is correct
-   (hands out distinct `.100`/`.101`). Fix: lock the three methods (~0.25d).
+   transaction within a transaction`. Fix: lock the three methods.
 
-Total ~2.0d, no PostgreSQL. SQLite is adequate; both issues are semantic/locking,
-not throughput. Leaks observed: timeout-killed pytest orphans a range's
-libvirtd+QEMU (teardown fixture skipped on SIGKILL), and legacy-mode teardown
-never reclaims overlay/seed dirs — a parallel runner needs a post-run reaper +
-leak assertion. **No code changed in this issue (analysis only); EC2 left
+3. **Test-infra — legacy-mode data-plane collision (found during
+   implementation, NOT in the original analysis):** topo1-7 ran in legacy mode
+   (`use_namespaces=False`), which shares the host network stack, so concurrent
+   ranges with overlapping DATA subnets (topo1/topo2 both `10.0.1.0/24`) collide.
+   Fix: namespace mode is now the `Topology.deploy` default. (Plus a test-level
+   hardcoded `192.168.100.1` assert in topo2.)
+
+No PostgreSQL; SQLite is adequate (all three are semantic/locking, not
+throughput). Effort estimate `~2.0d` in the plan **undershot** — the
+namespace-default flip + de-hardcoding + EC2 iteration were not anticipated.
+Leaks observed are harness artifacts: a force-killed pytest (shell `timeout` or
+manual kill) orphans a range's libvirtd+QEMU (teardown skipped); the product
+`destroy` reaps cleanly (proven by the CLI test). Legacy-mode teardown also never
+reclaims overlay/seed dirs (pre-existing). A parallel runner needs in-process
+timeouts + a post-run reaper + leak assertion. **The fixes WERE implemented and
+committed (see Implementation Log); the original `pytest -n 4` acceptance is the
+one open item (see Handoff). EC2 left
 running and cleaned to a zero baseline.**
 
 ## Progress Log
@@ -418,11 +439,15 @@ Run via `iso-concurrent-run.sh` after the fixes:
   12 routes to `.100` all `src .254`).
 - **Mode B GONE**: `test_topo6` (false ISOLATION BREACH) now **passes**; so do
   cli, topo1, topo4, topo5, topo7.
-- Remaining A failures (topo2 VyOS routed-ping, sdk 473s ssh, topo3 +
-  ns_integration killed at the 900s cap, ns_regression 3/9) are **resource-
-  contention timeouts from booting ~35 VMs at once** — not correctness. Proven
-  by: VMs reach `ready` with correct distinct mgmt IPs; the slow ones just blow
-  the per-node ssh-ready timeout under load.
+- Remaining A failures had **mixed causes** (initial "all contention" read was
+  WRONG — corrected in checkpoint C below):
+  - **topo2** = NOT contention. Two real causes: topo1-7 ran in **legacy mode**
+    (data-plane collision on shared `10.0.1.0/24`) AND a **hardcoded
+    `192.168.100.1` assertion** that breaks once the range draws `.101`+. Both
+    fixed (see checkpoint C).
+  - **sdk (473s), topo3 + ns_integration (killed at the 900s cap), ns_regression
+    3/9** = genuine resource contention from booting ~35 VMs at once; VMs reach
+    `ready` but slow boots blow the per-node ssh-ready timeout.
 - **Leak class reconfirmed**: the 900s **shell** `timeout` SIGKILLs pytest →
   skips fixture teardown → orphans that range's libvirtd+QEMU (17 qemu + 5
   libvirtd here). The tests themselves destroy correctly (per-range
