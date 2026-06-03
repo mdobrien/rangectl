@@ -1,11 +1,12 @@
 # Exploration: Parallel Test Isolation — What Actually Breaks
 **Created**: 2026-06-02
-**Status**: Fixes implemented (6,1,4,2,3,5) — Gate 1 green (308); Gate 2 checkpoint C in progress
+**Status**: Fixes implemented (6,1,4,2,3,5 + namespace-default) — Gate 1 green (308); product validated via CLI; **`pytest -n 4` full integration suite NOT yet green (handoff below)**
 
 > **Implementation update (2026-06-03):** the fix plan below was approved and
 > built. See **## Implementation Log** at the bottom for what landed, the
-> commits, and the Gate-1/Gate-2 results. The analysis sections are unchanged
-> (the original empirical findings).
+> commits, and the Gate-1/Gate-2 results. **## Handoff** (also at the bottom) is
+> the pickup point for the next agent. The analysis sections are unchanged (the
+> original empirical findings).
 
 ## Related Issues
 - **Parent / prior analysis**: `20260601-5-parallel-test-isolation.md` — desk analysis of the two root causes; this issue **empirically confirms** them by running the suite concurrently on EC2 and adds the exact failure signatures + a false-isolation finding the desk analysis missed.
@@ -484,3 +485,68 @@ boot staggering or fewer concurrent VM-heavy files.
 - A real `rangectl test --parallel` should pair in-process timeouts with a
   **post-run reaper + leak assert** (count netns/veth/qemu == 0) as a backstop
   for any worker that dies before teardown.
+
+## Handoff (2026-06-03) — picking up the `pytest -n 4` suite
+**Goal remaining:** the original acceptance — `pytest -n 4 tests/integration/`
+green with zero leaks. Everything else is done (see Implementation Log).
+
+### State right now
+- All fixes committed on `main` (latest commits: `e2adf9a` `f701668` `c8cb781`
+  `4f5eaf4` `1bc575c` `6358b51` `7cd6233` + doc updates). Gate 1: **308 unit
+  tests pass** locally.
+- **EC2 is STOPPED.** Resume with `scratch/scripts/ec2.sh start`, then
+  `ec2.sh ip`. Re-sync code (rsync `rangectl tests scratch` — the box has older
+  code from before the last sync attempt failed on an SSH timeout).
+- Product capability is proven: `iso-cli-multirange.sh` ran 8 concurrent ranges,
+  zero leaks. `pytest -n 2` (subset) clean. The **full suite at `-n 4` has NOT
+  been run to completion** — the two prior attempts were killed mid-run.
+
+### How to run it (do NOT kill it mid-run)
+```
+scratch/scripts/ec2.sh start && IP=$(scratch/scripts/ec2.sh ip)
+# rsync rangectl/ tests/ scratch/ to the box, then:
+scratch/scripts/ec2.sh ssh "cd /home/ubuntu/rangectl && bash scratch/scripts/iso-xdist-run.sh 4"
+```
+`iso-xdist-run.sh` already uses `-n 4 --dist loadfile` (4 *files* at a time) +
+**in-process `pytest --timeout` (NOT shell `timeout`)** + per-worker boot stagger
++ pre-run registry reset + post-run leak inventory.
+
+**Critical:** let it run to completion. The "14 ranges accumulated / 17 qemu
+leaked" earlier was an artifact of **killing pytest mid-run** (SIGKILL skips
+fixture teardown). When `-n 2` ran to completion the host returned to
+`registry={}` / zero leaks. In-process timeout means even a stuck test tears down.
+
+### What to expect / likely remaining work
+1. **Contention.** 4 VM-heavy files booting together can blow the per-node
+   ssh-ready timeout. If tests fail with `ssh ... timed out` while VMs reach
+   `ready`, that's contention, not isolation. Mitigations, in order of
+   preference: increase the per-worker stagger (conftest `_stagger_worker_start`,
+   currently `gwN → N*5s`); or `--dist loadgroup` + `@pytest.mark.xdist_group`
+   to keep the heaviest files (`ns_regression`, `topo6`) off the same wave; or
+   drop to `-n 3`. The box (96 core) handled 8 simple ranges at load 4.5, so
+   resources aren't the hard limit — simultaneous *boot* I/O is.
+2. **More test-level hardcoded assumptions.** Like the `topo2.py:52`
+   `192.168.100.1` assert already fixed — grep each test for fixed IPs/subnets;
+   concurrent ranges draw `.101`+ from the registry. Derive expected values from
+   `rng[node].mgmt_ip`, never hardcode `.100`.
+3. **Leak-on-deploy-FAILURE (verify).** Unconfirmed: does `engine`'s
+   `cleanup_on_fail` path in **namespace mode** call `_teardown_namespace`
+   (reaps libvirtd) or only free subnet + delete netns? `engine.py` ~line
+   259-282 (`_cleanup`) vs the normal `destroy` (~786). If a failed deploy leaks
+   libvirtd, harden that path. (Normal `destroy` is clean — proven by the CLI.)
+
+### Cleanup if you hit orphans (range.json gone, CLI can't reach them)
+Scoped PID reaper (NOT blanket `pkill qemu-system` — see `cli-reference.md`):
+SIGTERM→5s→SIGKILL processes matching `'/usr/sbin/libvirtd --config /ranges'`
+and `'unshare --pid --fork'`; then `find /ranges -mindepth 1 -delete`,
+clear overlays/seeds, `find /run/rangectl -name mgmt_subnets.json -delete`,
+delete stray `mgh*`/`rlmgt-*` links. (The reaper python snippet used this
+session is in the transcript; or rebuild from `supervisor._terminate`.)
+
+### Useful scripts (all in `scratch/scripts/`)
+- `iso-xdist-run.sh N` — the `-n N` suite runner (checkpoint C).
+- `iso-cli-multirange.sh N` — CLI product test (deploy N ranges, list/exec/destroy).
+- `iso-cli-deploy.py <name>` — deploy one persistent range to the prod DB.
+- `iso-concurrent-run.sh` — per-file process harness (12 files at once; the
+  original max-stress reproducer).
+- `iso-multirange-prod.py` — thread-parallel multi-range against one shared DB.
