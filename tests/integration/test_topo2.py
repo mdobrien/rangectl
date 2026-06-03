@@ -48,8 +48,11 @@ def test_topo2_routed_ping(backend, db):
         )
         log.info("router interfaces:\n%s", out.stdout)
         # The bootstrap renamed e<i+2> -> eth<i> and pinned hw-id, so the
-        # router should expose eth0/eth1/eth2 with the IPs we configured.
-        assert "eth0" in out.stdout and "192.168.100.1/24" in out.stdout
+        # router should expose eth0/eth1/eth2 with the IPs we configured. The
+        # mgmt IP is allocated from the host-global pool (NOT always .100.1 —
+        # concurrent ranges get .101, .102, ...), so derive it from the range.
+        router_mgmt = rng["router"].mgmt_ip
+        assert "eth0" in out.stdout and f"{router_mgmt}/24" in out.stdout
         assert "eth1" in out.stdout and "10.0.1.1/24" in out.stdout
         assert "eth2" in out.stdout and "10.0.2.1/24" in out.stdout
 

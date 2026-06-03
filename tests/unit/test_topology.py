@@ -10,7 +10,7 @@ from rangectl.types import InterfaceSpec
 def test_topology_deploy_returns_range(backend, db):
     t = Topology("topo1", backend=backend, db=db)
     t.node("a", image="ubuntu", vcpu=1, memory=1024)
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     assert isinstance(rng, Range)
     assert "a" in rng._nodes
     assert isinstance(rng["a"], LiveNode)
@@ -24,13 +24,13 @@ def test_topology_deploy_without_backend_raises():
     t = Topology("nope")
     t.node("a", image="ubuntu")
     with pytest.raises(RuntimeError):
-        t.deploy()
+        t.deploy(use_namespaces=False)
 
 
 def test_topology_deploy_context_manager_destroys(backend, db):
     t = Topology("ctx", backend=backend, db=db)
     t.node("a", image="ubuntu", vcpu=1, memory=1024)
-    with t.deploy() as rng:
+    with t.deploy(use_namespaces=False) as rng:
         assert rng["a"].name == "a"
     # On exit the engine should have destroyed the topology.
     assert db.get_topology("ctx") is None
@@ -39,7 +39,7 @@ def test_topology_deploy_context_manager_destroys(backend, db):
 def test_topology_destroy_via_engine(backend, db):
     t = Topology("destroyme", backend=backend, db=db)
     t.node("a", image="ubuntu")
-    t.deploy()
+    t.deploy(use_namespaces=False)
     t.destroy()
     assert db.get_topology("destroyme") is None
 

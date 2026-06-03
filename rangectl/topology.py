@@ -125,9 +125,14 @@ class Topology:
         return lnk
 
     def deploy(self, cleanup_on_fail: bool = True,
-               use_namespaces: bool = False,
+               use_namespaces: bool = True,
                resources: Any = None,
                internet: str = "none") -> Range:
+        # Namespace mode is the default: each range gets its own netns, so data
+        # subnets AND mgmt are isolated and multiple ranges run concurrently with
+        # no cross-talk. Legacy host-level mode (use_namespaces=False) shares the
+        # host network stack — ranges with overlapping data subnets collide — and
+        # is kept only as an explicit opt-in.
         from rangectl.engine import Engine
         log.info("Deploying topology '%s' (%d nodes, %d links, cleanup_on_fail=%s, "
                  "use_namespaces=%s, internet=%s)",

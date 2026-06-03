@@ -20,7 +20,7 @@ def _two_node_topo(backend, db, name="rng"):
 
 def test_range_getitem(backend, db):
     t = _two_node_topo(backend, db)
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     assert isinstance(rng["a"], LiveNode)
     assert rng["a"].name == "a"
     with pytest.raises(KeyError):
@@ -29,7 +29,7 @@ def test_range_getitem(backend, db):
 
 def test_range_link_lookup(backend, db):
     t = _two_node_topo(backend, db)
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     lnk = rng.link("a", "b")
     assert isinstance(lnk, Link)
     # Symmetric lookup
@@ -40,7 +40,7 @@ def test_range_link_lookup(backend, db):
 
 def test_range_snapshot_records_calls(backend, db):
     t = _two_node_topo(backend, db, "snap")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     backend.calls.clear()
     rng.snapshot("checkpoint")
     snap_calls = backend.calls_of("snapshot")
@@ -52,7 +52,7 @@ def test_range_snapshot_records_calls(backend, db):
 
 def test_range_restore_uses_db_lookup(backend, db):
     t = _two_node_topo(backend, db, "rst")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     rng.snapshot("v1")
     backend.calls.clear()
     rng.restore("v1")
@@ -66,7 +66,7 @@ def test_range_restore_uses_db_lookup(backend, db):
 
 def test_range_logs(backend, db):
     t = _two_node_topo(backend, db, "logs")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     all_logs = rng.logs()
     assert isinstance(all_logs, list)
     assert all_logs  # deployment writes events
@@ -75,7 +75,7 @@ def test_range_logs(backend, db):
 
 def test_range_logs_level_filter(backend, db):
     t = _two_node_topo(backend, db, "lvl")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     db.log_event("lvl", None, "error", "boom")
     errors = rng.logs(level="error")
     assert len(errors) == 1
@@ -86,7 +86,7 @@ def test_range_logs_level_filter(backend, db):
 
 def test_live_node_exec(backend, db):
     t = _two_node_topo(backend, db, "exec1")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     backend.calls.clear()
     rng["a"].exec("uname -a")
     assert backend.calls_of("exec")[0][0][1] == "uname -a"
@@ -94,7 +94,7 @@ def test_live_node_exec(backend, db):
 
 def test_live_node_upload(backend, db):
     t = _two_node_topo(backend, db, "upl")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     backend.calls.clear()
     rng["a"].upload("/local/foo", "/remote/bar")
     upl = backend.calls_of("upload")[0][0]
@@ -104,7 +104,7 @@ def test_live_node_upload(backend, db):
 
 def test_live_node_template_renders_and_uploads(backend, db, tmp_path):
     t = _two_node_topo(backend, db, "tpl")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     tmpl_path = tmp_path / "t.j2"
     tmpl_path.write_text("hello {{ name }}, port={{ port }}")
     # The tempfile is cleaned up after upload returns, so capture content
@@ -126,7 +126,7 @@ def test_live_node_template_renders_and_uploads(backend, db, tmp_path):
 def test_live_node_template_cleans_up_tempfile(backend, db, tmp_path):
     """The rendered temp file should not persist after template() returns."""
     t = _two_node_topo(backend, db, "tpl2")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     tmpl_path = tmp_path / "t.j2"
     tmpl_path.write_text("x={{ x }}")
     captured = {}
@@ -140,7 +140,7 @@ def test_live_node_template_cleans_up_tempfile(backend, db, tmp_path):
 
 def test_live_node_logs(backend, db):
     t = _two_node_topo(backend, db, "lnlogs")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     db.log_event("lnlogs", "a", "info", "node a event")
     db.log_event("lnlogs", "b", "info", "node b event")
     a_logs = rng["a"].logs()
@@ -151,7 +151,7 @@ def test_live_node_logs(backend, db):
 
 def test_live_node_snapshot_restore(backend, db):
     t = _two_node_topo(backend, db, "lnsnap")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     backend.calls.clear()
     snap_id = rng["a"].snapshot("ckpt")
     assert snap_id  # backend assigns one
@@ -169,7 +169,7 @@ def test_live_node_snapshot_restore(backend, db):
 
 def test_link_down(backend, db):
     t = _two_node_topo(backend, db, "down")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     lnk = rng.link("a", "b")
     backend.calls.clear()
     lnk.down()
@@ -182,7 +182,7 @@ def test_link_down(backend, db):
 
 def test_link_up(backend, db):
     t = _two_node_topo(backend, db, "up")
-    rng = t.deploy()
+    rng = t.deploy(use_namespaces=False)
     lnk = rng.link("a", "b")
     lnk.down()
     backend.calls.clear()
