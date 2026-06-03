@@ -1,6 +1,11 @@
 # Exploration: Parallel Test Isolation — What Actually Breaks
 **Created**: 2026-06-02
-**Status**: Complete (analysis only — no fixes implemented)
+**Status**: Fixes implemented (6,1,4,2,3,5) — Gate 1 green (308); Gate 2 checkpoint C in progress
+
+> **Implementation update (2026-06-03):** the fix plan below was approved and
+> built. See **## Implementation Log** at the bottom for what landed, the
+> commits, and the Gate-1/Gate-2 results. The analysis sections are unchanged
+> (the original empirical findings).
 
 ## Related Issues
 - **Parent / prior analysis**: `20260601-5-parallel-test-isolation.md` — desk analysis of the two root causes; this issue **empirically confirms** them by running the suite concurrently on EC2 and adds the exact failure signatures + a false-isolation finding the desk analysis missed.
@@ -385,3 +390,54 @@ running and cleaned to a zero baseline.**
   **product** StateDB bug — `delete_topology`/`add_image`/`remove_image` write
   outside `self._lock` → `cannot start a transaction within a transaction`. Added
   Fix 6. Host returned to zero baseline; EC2 left running.
+
+## Implementation Log
+TDD, build-test-repeat. Commits land each fix with its Gate-1 unit test.
+
+### What landed (commit → fix)
+| Commit | Fix | What |
+|---|---|---|
+| `e2adf9a` | **6 + 1** | `state.py`: lock `delete_topology`/`add_image`/`remove_image`. New `rangectl/subnet_registry.py` — host-global flock-guarded JSON allocator (`RANGECTL_SUBNET_REGISTRY`, default `~/.rangectl/mgmt_subnets.json`). `StateDB` delegates allocation to it, mirrors result into its table. Unit conftest points it at per-test tmp; integration conftest shares `/run/rangectl`. |
+| `f701668` | **4 + 2 + 3** | `networking.mgmt_isolation_rules()` DROPs every ordered pair of `mgh+`/`rlmgt+` (cross-scheme); `netns.py` + `libvirt_backend.py` use it. `RANGECTL_RANGE_PREFIX` prepended to `Topology` names; `RANGECTL_STATE_ROOT` overrides overlay/seed root. Both opt-in, empty default. |
+| `c8cb781` | **5** | xdist 3.8.0 (installs fine from PyPI — old "1.24.1 max" no longer holds). `iso-xdist-run.sh`: `-n N --dist loadfile` + **pytest-timeout in-process** (teardown-safe, no orphan leak) + per-worker boot stagger (gwN → N·5s) in integration conftest. |
+
+### Gate 1 (unit) — GREEN
+308 unit tests pass. New tests:
+- `test_state_concurrency.py::test_concurrent_writers_no_transaction_error`
+  (file-backed sqlite — reproduces then fixes the Phase-6 crash).
+- `test_subnet_registry.py` — sequential/free/reuse/exhaustion + **16-thread
+  contention → all-distinct subnets**.
+- `test_networking.py::test_mgmt_isolation_rules_cover_all_prefix_pairs`.
+- `test_parallel_isolation_env.py` — prefix + state-root overrides.
+
+### Gate 2 checkpoint A (12 files at once, ~35 VMs) — keystone PROVEN
+Run via `iso-concurrent-run.sh` after the fixes:
+- **Subnet collision GONE**: registry handed out distinct `/24s` (nstwo=.101,
+  topo3=.103, sdkrange=.105, nstopo4=.100); host shows **1 route per /24** (was
+  12 routes to `.100` all `src .254`).
+- **Mode B GONE**: `test_topo6` (false ISOLATION BREACH) now **passes**; so do
+  cli, topo1, topo4, topo5, topo7.
+- Remaining A failures (topo2 VyOS routed-ping, sdk 473s ssh, topo3 +
+  ns_integration killed at the 900s cap, ns_regression 3/9) are **resource-
+  contention timeouts from booting ~35 VMs at once** — not correctness. Proven
+  by: VMs reach `ready` with correct distinct mgmt IPs; the slow ones just blow
+  the per-node ssh-ready timeout under load.
+- **Leak class reconfirmed**: the 900s **shell** `timeout` SIGKILLs pytest →
+  skips fixture teardown → orphans that range's libvirtd+QEMU (17 qemu + 5
+  libvirtd here). The tests themselves destroy correctly (per-range
+  `engine.destroy`); nothing pkills. ⇒ checkpoint C switches to **in-process
+  pytest-timeout** (teardown runs) + bounded `-n 4` to avoid both the herd and
+  the leak. Manually reaped A's orphans via SIGTERM to the pid-ns inits.
+
+### Gate 2 checkpoint C (real acceptance: `pytest -n 4 --dist loadfile`) — IN PROGRESS
+Bounded 4-way concurrency (≈10–15 VMs peak) with the boot stagger; mid-run host
+showed distinct registry subnets and 1 route per /24. Result + final leak
+inventory to be appended.
+
+### Notes / follow-ups
+- **Legacy-mode disk leak** (overlay/seed dirs for `topo1-7` not reclaimed):
+  pre-existing single-range bug — `cleanup_vm_storage` runs only on the
+  namespace teardown path. Not fixed here; candidate for its own issue.
+- A real `rangectl test --parallel` should pair in-process timeouts with a
+  **post-run reaper + leak assert** (count netns/veth/qemu == 0) as a backstop
+  for any worker that dies before teardown.
