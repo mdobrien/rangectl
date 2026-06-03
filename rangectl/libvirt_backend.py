@@ -492,16 +492,20 @@ class LibvirtBackend:
             self._ensure_mgmt_isolation()
 
     def _ensure_mgmt_isolation(self) -> None:
-        rule = ["-i", "rlmgt+", "-o", "rlmgt+", "-j", "DROP"]
-        check = _run(["iptables", "-C", "FORWARD", *rule], check=False)
-        if check.returncode == 0:
-            return
-        log.info("Installing mgmt-bridge isolation rule: FORWARD %s",
-                 " ".join(rule))
-        ins = _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
-        if ins.returncode != 0:
-            log.warning("Failed to install mgmt isolation rule: %s",
-                        ins.stderr)
+        # Drop forwarding between any two range mgmt interfaces, across both the
+        # legacy (rlmgt+) and namespace (mgh+) schemes — a legacy and a
+        # namespace range running concurrently must not route to each other.
+        from rangectl.networking import mgmt_isolation_rules
+        for rule in mgmt_isolation_rules():
+            if _run(["iptables", "-C", "FORWARD", *rule],
+                    check=False).returncode == 0:
+                continue
+            log.info("Installing mgmt-bridge isolation rule: FORWARD %s",
+                     " ".join(rule))
+            ins = _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
+            if ins.returncode != 0:
+                log.warning("Failed to install mgmt isolation rule: %s",
+                            ins.stderr)
 
     def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
         # Interfaces are inlined into the domain XML at create_vm time. On

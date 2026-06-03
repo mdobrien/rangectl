@@ -7,11 +7,24 @@ from rangectl.networking import (
     bridge_name,
     mgmt_bridge_name,
     mgmt_host_ip,
+    mgmt_isolation_rules,
 )
 
 
 def test_allocate_mgmt_ip_index_zero():
     assert allocate_mgmt_ip("192.168.100.0/24", 0) == "192.168.100.1"
+
+
+def test_mgmt_isolation_rules_cover_all_prefix_pairs():
+    """DROP rules must block forwarding between every ordered pair of mgmt
+    prefixes, including the cross-scheme mgh+ <-> rlmgt+ pairs."""
+    rules = mgmt_isolation_rules()
+    pairs = {(r[1], r[3]) for r in rules}
+    assert pairs == {
+        ("mgh+", "mgh+"), ("mgh+", "rlmgt+"),
+        ("rlmgt+", "mgh+"), ("rlmgt+", "rlmgt+"),
+    }
+    assert all(r[-2:] == ["-j", "DROP"] for r in rules)
 
 
 def test_allocate_mgmt_ip_sequential():

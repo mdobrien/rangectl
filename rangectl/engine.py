@@ -37,6 +37,11 @@ log = logging.getLogger(__name__)
 # them without a custom rule. Fall back to ~/.rangectl when running unit tests
 # that won't actually launch qemu.
 def _state_root() -> Path:
+    # Explicit override (e.g. a per-worker dir in a parallel test runner) so
+    # overlays/seeds never share a path across concurrent runs of the same name.
+    override = os.environ.get("RANGECTL_STATE_ROOT")
+    if override:
+        return Path(override)
     libvirt = Path("/var/lib/libvirt/images")
     if libvirt.exists() and os.access(libvirt, os.W_OK):
         return libvirt / "rangectl"

@@ -45,6 +45,31 @@ def mgmt_bridge_name(topology_name: str) -> str:
     return f"rlmgt-{_short_topo(topology_name)}"
 
 
+# Host-side mgmt interface name prefixes, one per deploy mode:
+#   - "mgh+"   namespace mode host-side veth (netns.py _mgmt_veth_names)
+#   - "rlmgt+" legacy host-level mgmt bridge (mgmt_bridge_name above)
+# Both carry the .254 gateway, so with ip_forward=1 the host would route between
+# ranges unless forwarding between any two of them is dropped.
+MGMT_IFACE_PREFIXES = ("mgh+", "rlmgt+")
+
+
+def mgmt_isolation_rules() -> list[list[str]]:
+    """FORWARD DROP rules blocking forwarding between ANY two range mgmt
+    interfaces, across BOTH naming schemes.
+
+    A single ``mgh+ -> mgh+`` (or ``rlmgt+ -> rlmgt+``) rule only isolates ranges
+    of the same mode; a namespace range and a legacy range running concurrently
+    could still route to each other's mgmt subnet. Covering every ordered pair
+    of prefixes closes that cross-scheme gap. host<->range and range->internet
+    (``-o <uplink>``) are untouched.
+    """
+    return [
+        ["-i", i, "-o", o, "-j", "DROP"]
+        for i in MGMT_IFACE_PREFIXES
+        for o in MGMT_IFACE_PREFIXES
+    ]
+
+
 # --- netns-scoped names (v2) ---------------------------------------------
 # Inside a range's network namespace, bridge names are scoped to the namespace,
 # so collisions across ranges are impossible and no hashing is needed. These

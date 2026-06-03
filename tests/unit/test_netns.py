@@ -102,9 +102,12 @@ def test_create_mgmt_network_iptables_idempotent():
     cmds = _cmds(run)
     inserts = [c for c in cmds if c[:3] == ["iptables", "-I", "FORWARD"]]
     # The per-subnet ACCEPTs are skipped (already present), but the inter-range
-    # isolation DROP is always re-inserted (delete-then-insert by design).
-    assert inserts == [["iptables", "-I", "FORWARD", "1",
-                        "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]]
+    # isolation DROPs are always re-inserted (delete-then-insert by design) —
+    # one per ordered pair of mgmt prefixes (mgh+/rlmgt+), covering cross-scheme.
+    from rangectl.networking import mgmt_isolation_rules
+    expected = [["iptables", "-I", "FORWARD", "1", *rule]
+                for rule in mgmt_isolation_rules()]
+    assert inserts == expected
 
 
 def test_create_mgmt_network_installs_inter_range_isolation_drop():

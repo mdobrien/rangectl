@@ -65,14 +65,18 @@ class Topology:
         db: Any = None,
         container_backend: Any = None,
     ) -> None:
-        self.name = name
+        # Optional host-unique prefix (e.g. an xdist worker id or uuid) so two
+        # concurrent runs of the SAME range name never collide on netns / veth
+        # hash / seed+overlay paths, which all derive from the range name. Empty
+        # by default — no behavior change outside a parallel test runner.
+        self.name = f'{os.environ.get("RANGECTL_RANGE_PREFIX", "")}{name}'
         self._nodes: dict[str, Node] = {}
         self._links: list[Link] = []
         self._backend = backend
         self._container_backend = container_backend
         self._db = db
         self._engine = None
-        log.info("Topology '%s' created", name)
+        log.info("Topology '%s' created", self.name)
 
     def node(
         self,
