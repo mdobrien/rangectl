@@ -128,6 +128,10 @@ def _isolate_state_roots(tmp_path, monkeypatch):
     from rangectl import engine as engine_mod
     monkeypatch.setattr(engine_mod, "SEED_ROOT", tmp_path / "seeds")
     monkeypatch.setattr(engine_mod, "OVERLAY_ROOT", tmp_path / "overlays")
+    # Subnet allocation is host-global (flock registry). Point it at a per-test
+    # file so unit tests stay hermetic — otherwise every test would share the
+    # real ~/.rangectl registry and allocate non-deterministic /24s.
+    monkeypatch.setenv("RANGECTL_SUBNET_REGISTRY", str(tmp_path / "subnets.json"))
 
 
 @pytest.fixture

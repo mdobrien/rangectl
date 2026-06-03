@@ -9,6 +9,12 @@ LOGDIR=/tmp/iso-run
 sudo rm -f "$LOGDIR"/*.log 2>/dev/null
 mkdir -p "$LOGDIR"
 
+# Reset the host-global subnet registry so a prior crashed/timed-out batch's
+# stale entries don't shrink the pool. Ranges free their /24 on teardown.
+sudo mkdir -p /run/rangectl
+sudo find /run/rangectl -maxdepth 1 -name 'mgmt_subnets.json' -delete 2>/dev/null
+echo "subnet registry reset"
+
 echo "=== PRE-RUN host state ==="
 echo "qemu=$(ps aux | grep qemu-system | grep -v grep | wc -l) libvirtd=$(ps aux | grep 'libvirtd --config' | grep -v grep | wc -l) netns=$(ip netns list 2>/dev/null | grep -c rangectl) veth=$(ip link show 2>/dev/null | grep -cE 'mgh|mgp')"
 
@@ -47,5 +53,9 @@ echo "--/ranges dirs--";      ls /ranges/ 2>/dev/null
 echo "--overlays--";          ls /var/lib/libvirt/images/rangectl/overlays/ 2>/dev/null
 echo "--seeds--";             ls /var/lib/libvirt/images/rangectl/seeds/ 2>/dev/null
 echo "--mgmt .254 addrs on host (subnet collision evidence)--"
-ip -o -4 addr show 2>/dev/null | grep -E 'mgh' | awk '{print $2, $4}'
+ip -o -4 addr show 2>/dev/null | grep -E 'mgh|rlmgt' | awk '{print $2, $4}'
+echo "--distinct host routes to mgmt /24s (should be 1 route per /24)--"
+ip route show 2>/dev/null | grep -oE '192\.168\.1[0-9][0-9]\.0/24' | sort | uniq -c
+echo "--subnet registry contents--"
+sudo cat /run/rangectl/mgmt_subnets.json 2>/dev/null || echo "(empty/cleared)"
 echo "=== DONE ==="

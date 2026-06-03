@@ -58,3 +58,42 @@ def test_concurrent_reads_and_writes_no_interface_error(tmp_path):
         assert not errors, f"concurrent access raised: {errors[0]!r}"
     finally:
         db.close()
+
+
+def test_concurrent_writers_no_transaction_error(tmp_path):
+    """delete_topology/add_image/remove_image must serialize on the shared lock.
+
+    Without the lock these methods issue multi-statement writes on the shared
+    connection; two threads interleaving raise sqlite3.OperationalError
+    ("cannot start a transaction within a transaction"). Reproduces the crash
+    seen deploying two ranges in parallel threads against one StateDB
+    (Phase 6, scratch/issues/20260602-1-parallel-test-exploration.md).
+
+    Must use a file-backed DB, not :memory: — :memory: won't reproduce the
+    shared-connection transaction interleave.
+    """
+    db = StateDB(db_path=str(tmp_path / "state.db"))
+    try:
+        errors: list[BaseException] = []
+
+        def churn(idx: int) -> None:
+            try:
+                for i in range(60):
+                    topo = f"t{idx}-{i}"
+                    db.save_topology(topo, "deploying",
+                                     "192.168.100.0/24", "mgmt-br")
+                    db.add_image(f"img{idx}-{i}", "/img/x.qcow2")
+                    db.remove_image(f"img{idx}-{i}")
+                    db.delete_topology(topo)
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=churn, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"concurrent writers raised: {errors[0]!r}"
+    finally:
+        db.close()

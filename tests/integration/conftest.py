@@ -14,6 +14,14 @@ log = logging.getLogger(__name__)
 
 MGMT_SUBNET_CIDR = "192.168.100.0/24"
 
+# Share ONE host-global subnet registry across every integration process (the
+# per-file concurrency harness and pytest-xdist workers each import this
+# conftest), so concurrent ranges get distinct /24s instead of all grabbing
+# .100.0. A fixed path under /run keeps it host-wide and ephemeral; the run
+# harness resets it before each batch. See subnet_registry.py.
+os.environ.setdefault("RANGECTL_SUBNET_REGISTRY",
+                      "/run/rangectl/mgmt_subnets.json")
+
 # Standard locations on the EC2 host (set up by ec2-bootstrap.sh).
 LIBVIRT_IMAGES = Path("/var/lib/libvirt/images")
 IMAGE_PATHS = {

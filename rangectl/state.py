@@ -1,17 +1,14 @@
 from __future__ import annotations
-import ipaddress
 import logging
 import sqlite3
 import threading
 from pathlib import Path
 
+from rangectl import subnet_registry
+
 log = logging.getLogger(__name__)
 
 DB_PATH = Path("~/.rangectl/rangectl.db").expanduser()
-
-MGMT_POOL_BASE = ipaddress.IPv4Network("192.168.100.0/24")
-MGMT_POOL_PREFIX = 24
-MGMT_POOL_SIZE = 100  # /24s available: 192.168.100.0/24 .. 192.168.199.0/24
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS topologies (
@@ -104,13 +101,18 @@ def _row_to_dict(cursor: sqlite3.Cursor, row: tuple) -> dict:
 
 class StateDB:
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(self, db_path: str | Path | None = None,
+                 subnet_registry: str | Path | None = None) -> None:
         if db_path == ":memory:":
             self._path = ":memory:"
         else:
             path = Path(db_path) if db_path else DB_PATH
             path.parent.mkdir(parents=True, exist_ok=True)
             self._path = str(path)
+        # Host-global mgmt-subnet allocator path (None -> env/default resolved at
+        # call time). Subnet allocation is per-HOST, not per-DB, so independent
+        # StateDBs never hand out the same /24. See subnet_registry.py.
+        self._subnet_registry = subnet_registry
         log.info("StateDB opening at %s", self._path)
         # check_same_thread=False so wave-parallel deploys can write from worker
         # threads. The lock below serializes access — sqlite itself isn't safe
@@ -128,24 +130,22 @@ class StateDB:
 
     def allocate_mgmt_subnet(self, topology_name: str) -> str:
         log.info("Allocating mgmt subnet for topology '%s'", topology_name)
+        # Authoritative pick comes from the host-global flock registry so
+        # concurrent ranges (separate DBs/processes) never collide. Mirror the
+        # result into the local table for inspection/persistence.
+        candidate = subnet_registry.allocate(topology_name, self._subnet_registry)
         with self._lock:
-            cur = self._conn.execute("SELECT subnet FROM mgmt_subnets")
-            taken = {row[0] for row in cur.fetchall()}
-            base = int(MGMT_POOL_BASE.network_address)
-            for i in range(MGMT_POOL_SIZE):
-                candidate_net = ipaddress.IPv4Network((base + i * 256, MGMT_POOL_PREFIX))
-                candidate = f"{candidate_net.network_address}/{MGMT_POOL_PREFIX}"
-                if candidate not in taken:
-                    self._conn.execute(
-                        "INSERT INTO mgmt_subnets (subnet, topology_name) VALUES (?, ?)",
-                        (candidate, topology_name),
-                    )
-                    self._conn.commit()
-                    return candidate
-            raise RuntimeError("mgmt subnet pool exhausted")
+            self._conn.execute(
+                "INSERT OR REPLACE INTO mgmt_subnets (subnet, topology_name) "
+                "VALUES (?, ?)",
+                (candidate, topology_name),
+            )
+            self._conn.commit()
+        return candidate
 
     def free_mgmt_subnet(self, topology_name: str) -> None:
         log.info("Freeing mgmt subnet for topology '%s'", topology_name)
+        subnet_registry.free(topology_name, self._subnet_registry)
         with self._lock:
             self._conn.execute(
                 "DELETE FROM mgmt_subnets WHERE topology_name=?", (topology_name,)
@@ -234,30 +234,33 @@ class StateDB:
 
     def delete_topology(self, name: str) -> None:
         log.info("Deleting topology '%s' from DB", name)
-        self._conn.execute("DELETE FROM nodes WHERE topology_name=?", (name,))
-        self._conn.execute("DELETE FROM bridges WHERE topology_name=?", (name,))
-        self._conn.execute("DELETE FROM links WHERE topology_name=?", (name,))
-        self._conn.execute("DELETE FROM snapshots WHERE topology_name=?", (name,))
-        self._conn.execute("DELETE FROM mgmt_subnets WHERE topology_name=?", (name,))
-        self._conn.execute("DELETE FROM topologies WHERE name=?", (name,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM nodes WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM bridges WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM links WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM snapshots WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM mgmt_subnets WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM topologies WHERE name=?", (name,))
+            self._conn.commit()
 
     def add_image(self, name: str, path: str, inject: str = "pre-baked",
                   os_type: str = "linux", size_mb: int | None = None,
                   built_from: str | None = None) -> None:
         log.info("Adding image '%s' (path=%s, inject=%s)", name, path, inject)
-        self._conn.execute(
-            "INSERT OR REPLACE INTO images "
-            "(name, path, inject, os_type, size_mb, built_from) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (name, path, inject, os_type, size_mb, built_from),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO images "
+                "(name, path, inject, os_type, size_mb, built_from) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, path, inject, os_type, size_mb, built_from),
+            )
+            self._conn.commit()
 
     def remove_image(self, name: str) -> None:
         log.info("Removing image '%s'", name)
-        self._conn.execute("DELETE FROM images WHERE name=?", (name,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM images WHERE name=?", (name,))
+            self._conn.commit()
 
     def get_image(self, name: str) -> dict | None:
         log.info("Getting image '%s'", name)

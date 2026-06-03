@@ -16,6 +16,7 @@ import traceback
 from pathlib import Path
 
 from rangectl import Topology
+from rangectl import subnet_registry as sr
 from rangectl.engine import Engine
 from rangectl.libvirt_backend import LibvirtBackend
 from rangectl.state import StateDB
@@ -30,6 +31,7 @@ IMAGES = {
 }
 
 DB_PATH = "/tmp/iso-multirange-shared.db"
+REG_PATH = "/tmp/iso-multirange-subnets.json"
 
 
 def _build(name: str) -> Topology:
@@ -72,7 +74,8 @@ def _deploy_and_check(name: str, db: StateDB, backend: LibvirtBackend) -> None:
 
 def main() -> int:
     Path(DB_PATH).unlink(missing_ok=True)
-    db = StateDB(db_path=DB_PATH)
+    sr.reset(REG_PATH)
+    db = StateDB(db_path=DB_PATH, subnet_registry=REG_PATH)
     for n, (p, ostype) in IMAGES.items():
         if p.exists():
             db.add_image(name=n, path=str(p), inject="cloud-init", os_type=ostype)
