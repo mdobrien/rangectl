@@ -44,19 +44,53 @@ node). `exec` passes through the **remote command's** exit code.
 | `cleanup <range>` | force-remove orphaned state |
 | `images {list, add <name> <path> [--inject M] [--os-type T], remove <name>, info <name>}` | StateDB image registry |
 
+## Concurrent multi-range (validated)
+
+Multiple ranges run concurrently on one host with no cross-talk — deploy several
+(SDK, each its own process) and manage them via the CLI. Validated 2026-06-03:
+8 ranges (16 VMs) on **identical** internal addressing (`10.0.5.0/24`) all
+deployed, `exec`/ping worked per range, `destroy --all` reaped them — **zero
+leaks**, peak load ~4.5 on the 96-core box (deploy ~82s, destroy ~41s).
+
+- **Mgmt subnets are host-global**, allocated from a flock-guarded registry
+  (`rangectl/subnet_registry.py`, default `~/.rangectl/mgmt_subnets.json`,
+  override with `RANGECTL_SUBNET_REGISTRY`). Concurrent ranges get distinct
+  `/24s` (`192.168.100.0/24` … `199.0/24`) — they never both grab `.100`.
+- **Data subnets are isolated by netns**, so identical internal addressing
+  across ranges is non-colliding. This requires **namespace mode** — now the
+  default for `Topology.deploy()` (`use_namespaces=True`). Legacy host-level
+  mode (`use_namespaces=False`) shares the host stack and DOES collide on
+  overlapping data subnets; it's an explicit opt-in only.
+
 ## Teardown / cleanup (range-scoped — read this)
 
 To kill a range, use the CLI: `rangectl destroy <range>` (idempotent — falls
 back to `cleanup` if already gone) or `rangectl cleanup <range>` for orphans.
 Both are **range-scoped**: they kill only that range's libvirtd wrapper PID
 (from `range.json`) + cgroup; the kernel reaps that range's QEMU. `destroy
---all` does this per range.
+--all` does this per range. Teardown is clean — destroying N concurrent ranges
+leaves `qemu=0 libvirtd=0 netns=0 registry={}`.
 
 **NEVER** clean up with host-wide kills — `pkill -f qemu-system`,
 `pkill -f libvirtd`, blanket `ip netns del` loops. They reach across ranges and
 SIGTERM other agents' VMs mid-deploy (this happened: a blanket pkill in a test
 pre-clean killed a concurrent benchmark range). Tests/scripts must tear down
 their **own** range by name via the CLI.
+
+### Orphaned ranges with no `range.json` (the one case the CLI can't reach)
+
+If a process is **force-killed mid-run** (shell `timeout`, SIGKILL, a crashed
+`pytest -n` worker), Python teardown is skipped: the range's `range.json` /
+`/ranges/<name>` dir may be gone while its libvirtd + QEMU keep running. `destroy`
+and `cleanup` key off `range.json`, so they can't find these orphans. Avoid this
+by using in-process timeouts (`pytest --timeout`, which still runs teardown) over
+shell `timeout`. To reap orphans that already exist, target them by PID with
+SIGTERM → grace → SIGKILL (the same escalation `supervisor._terminate` uses) —
+match on `'/usr/sbin/libvirtd --config /ranges'` and `'unshare --pid --fork'`,
+NOT a blanket `pkill qemu-system`, so you only hit rangectl's own processes.
+Reaper: `scratch/scripts/` (see the reaper used in `20260602-1`). A real
+`rangectl test --parallel` should pair in-process timeouts with a post-run leak
+assert (`netns == veth == qemu == 0`) as a backstop.
 
 ## Gotchas
 
