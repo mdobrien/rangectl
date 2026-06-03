@@ -50,6 +50,27 @@ pytestmark_skip = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _stagger_worker_start(request):
+    """Spread concurrent xdist workers' first VM boots.
+
+    Without this, ``-n N`` boots every worker's first range at t=0 — a
+    thundering herd of QEMU starts that slows each boot enough to blow the
+    per-node ssh-ready timeout. Offsetting each worker by 5s smooths the initial
+    spike; once workers desync (tests finish at different times) no further
+    stagger is needed. No-op outside xdist (worker_id == 'master').
+    """
+    import re
+    import time
+    worker_id = getattr(request.config, "workerinput", {}).get("workerid", "")
+    m = re.match(r"gw(\d+)", worker_id)
+    if m:
+        delay = int(m.group(1)) * 5
+        log.info("worker %s staggering start by %ds", worker_id, delay)
+        time.sleep(delay)
+    yield
+
+
 @pytest.fixture
 def db(tmp_path) -> StateDB:
     state = StateDB(db_path=str(tmp_path / "state.db"))
