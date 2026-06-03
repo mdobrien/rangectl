@@ -306,6 +306,43 @@ A thin wrapper, not new infra:
 Recommended order: **6 → 1 → 4 → 2 → 3 → 5** (cheapest/highest-certainty product
 fix first, then the test-infra keystone, then hardening).
 
+## Implementation order & test strategy (build-test-repeat)
+Every fix lands with its own **Gate 1 unit test** (Gate 1 gates each commit —
+MockBackend + SQLite, runs anywhere). Gate 2 (EC2 KVM, ~13 min) is expensive and
+several fixes only demonstrate value *together*, so run it at **3 checkpoints**,
+not after every fix. Each Gate 2 run also asserts the post-run leak inventory
+(`netns == veth == qemu == 0`) so a leaking fix fails loudly.
+
+| # | Fix | Gate 1 unit test | Gate 2? |
+|---|---|---|---|
+| **6** | lock 3 StateDB writers | 2 threads hammer `delete_topology`/`add_image` on ONE StateDB → assert no `transaction within a transaction`. **Must use a file-backed temp sqlite, not `:memory:`** — the in-memory DB won't reproduce the shared-connection interleave. | no — fully unit-covered |
+| **1** | flock subnet allocator | N procs/threads allocate against a temp registry → assert distinct /24s, no double-grab, flock contention serializes | **Checkpoint A** |
+| **4** | unify inter-range DROP | unit-test only the rule-builder (emits both `mgh+` and `rlmgt+`); the actual block is iptables | **folds into A** |
+| **2** | per-worker name prefix | env → netns / veth-hash / seed-path derivation is unique per prefix | Checkpoint B |
+| **3** | per-run seed/overlay roots | env override → path; mirror the existing unit autouse fixture | folds into B |
+| **5** | working xdist | (infra — no unit test) | **Checkpoint C** |
+
+**Sequence & why it's also the test order (cheapest/most-unit-testable first):**
+1. **Fix 6 — standalone.** Pure Python, instant Gate 1, zero infra; de-risks the
+   *product* bug. Commit on green.
+2. **Fix 1 — keystone.** Unit-test the allocator in isolation; it's what makes
+   *any* concurrent integration possible. Commit on green.
+3. **Fix 4** alongside 1 (closes mode B's residual cross-scheme path).
+4. **Checkpoint A — first real Gate 2.** Run `scratch/scripts/iso-concurrent-run.sh`
+   (per-file concurrency) + `scratch/scripts/iso-multirange-prod.py` (thread
+   multi-range). Pass criteria: mode A gone (no ssh-auth failures), mode B gone
+   (topo6 isolation correct), zero leaks. This validates 6+1+4.
+5. **Fixes 2 + 3.** Unit-test the path/name derivation. Payoff is "N copies of
+   the *whole* suite," not just distinct files.
+6. **Checkpoint B — Gate 2 under duplicated suites** (run the same files 2–4×
+   concurrently) to prove name/seed/overlay hermeticity.
+7. **Fix 5** (working `pytest-xdist>=3` via venv).
+8. **Checkpoint C — acceptance:** Gate 1 sharded under `-n` first (cheap), then
+   `pytest -n 4 tests/integration/` green = done.
+
+Rule of thumb: **unit-test every fix (per-commit Gate 1); spend Gate 2 only at A,
+B, C.** A and B reuse the two harness scripts already committed in this issue.
+
 ## Resolution
 Two independent concurrency problems, both lightweight to fix:
 
