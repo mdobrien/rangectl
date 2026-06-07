@@ -219,6 +219,15 @@ class StateDB:
             )
             return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
+    def list_links(self, topology_name: str) -> list[dict]:
+        log.info("Listing links for topology '%s'", topology_name)
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM links WHERE topology_name=? ORDER BY id ASC",
+                (topology_name,),
+            )
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
     def get_topology(self, name: str) -> dict | None:
         log.info("Getting topology '%s'", name)
         with self._lock:

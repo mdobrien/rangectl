@@ -299,6 +299,35 @@ def cmd_internet(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_link(args: argparse.Namespace) -> int:
+    if not args.action:
+        _err("link requires an action: impair, clear, or status")
+        return 1
+    rng = Range.connect(args.range)
+    try:
+        link = rng.link(args.node_a, args.node_b)
+    except KeyError:
+        _err(f"no link between {args.node_a} and {args.node_b} in '{args.range}'")
+        return 2
+    if args.action == "impair":
+        params = {k: getattr(args, k) for k in
+                  ("latency", "jitter", "bandwidth", "loss", "reorder",
+                   "corrupt", "duplicate", "outbound")
+                  if getattr(args, k, None) is not None}
+        link.impair(**params)
+        print(f"Impaired {args.node_a} <-> {args.node_b}: "
+              f"{', '.join(f'{k}={v}' for k, v in params.items())}")
+    elif args.action == "clear":
+        link.clear()
+        print(f"Cleared impairments on {args.node_a} <-> {args.node_b}")
+    elif args.action == "status":
+        imp = link.impairments
+        for node, params in imp.items():
+            desc = ", ".join(f"{k}={v}" for k, v in params.items()) or "none"
+            print(f"  {node} egress: {desc}")
+    return 0
+
+
 def cmd_destroy(args: argparse.Namespace) -> int:
     if args.all:
         ranges = Range.list()
@@ -474,6 +503,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cleanup", help="force-remove an orphaned range")
     p.add_argument("range")
     p.set_defaults(func=cmd_cleanup)
+
+    p = sub.add_parser("link", help="impair, clear, or inspect a link")
+    p.add_argument("range")
+    p.add_argument("node_a")
+    p.add_argument("node_b")
+    lsub = p.add_subparsers(dest="action")
+    lp = lsub.add_parser("impair", help="apply tc netem impairments")
+    lp.add_argument("--latency")
+    lp.add_argument("--jitter")
+    lp.add_argument("--bandwidth")
+    lp.add_argument("--loss")
+    lp.add_argument("--reorder")
+    lp.add_argument("--corrupt")
+    lp.add_argument("--duplicate")
+    lp.add_argument("--outbound", help="degrade only this node's egress")
+    lsub.add_parser("clear", help="remove all impairments")
+    lsub.add_parser("status", help="show current impairments")
+    p.set_defaults(func=cmd_link)
 
     p = sub.add_parser("images", help="manage registered images")
     isub = p.add_subparsers(dest="images_action")

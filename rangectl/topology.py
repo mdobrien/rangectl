@@ -111,16 +111,20 @@ class Topology:
         self._nodes[name] = node
         return node
 
-    def link(self, if_a: InterfaceSpec, if_b: InterfaceSpec) -> Link:
-        log.info("Declaring link: %s/%s [%s] <-> %s/%s [%s]",
+    def link(self, if_a: InterfaceSpec, if_b: InterfaceSpec,
+             **impairments: Any) -> Link:
+        log.info("Declaring link: %s/%s [%s] <-> %s/%s [%s] impair=%s",
                  if_a.node_name, if_a.interface_name, if_a.ip,
-                 if_b.node_name, if_b.interface_name, if_b.ip)
+                 if_b.node_name, if_b.interface_name, if_b.ip, impairments)
         # Record IP on the node's interface so deploy() can configure it.
         node_a = self._nodes[if_a.node_name]
         node_a._interfaces[if_a.interface_name] = if_a
         node_b = self._nodes[if_b.node_name]
         node_b._interfaces[if_b.interface_name] = if_b
         lnk = Link(if_a, if_b, topology=self)
+        # Definition-time impairment defaults (latency=, bandwidth=, loss=, ...)
+        # are applied by the engine once the link's TAPs exist during deploy.
+        lnk._default_impairments = impairments
         self._links.append(lnk)
         return lnk
 
@@ -301,6 +305,12 @@ class Link:
         # recreated bridge. Populated by Engine._wire_link as
         # [(vm_id, mac), (vm_id, mac)].
         self._endpoints: list[tuple[str, str]] = []
+        # Current tc netem impairments, keyed by endpoint node name. Empty dict
+        # per side = clean link. Re-applied after Link.up() recreates the TAPs.
+        self._impairments: dict[str, dict] = {}
+        # Impairments declared at definition time (Topology.link kwargs),
+        # applied once by the engine after the link is wired during deploy.
+        self._default_impairments: dict = {}
 
     def down(self) -> None:
         log.info("Link down: %s/%s <-> %s/%s",
@@ -328,9 +338,103 @@ class Link:
         for vm_id, mac in self._endpoints:
             self._backend.attach_interface(vm_id, self._bridge_name, mac)
         self._is_up = True
+        # Recreating the bridge reset the TAPs to clean qdiscs — restore any
+        # impairments that were in effect before the link went down.
+        self._reapply_impairments()
         if self._db is not None and self._topology_name is not None:
             self._db.log_event(self._topology_name, None, "info",
                                f"link up: {self._bridge_name}")
+
+    # --- impairment (Phase 19 — WAN simulation via tc netem) --------------
+
+    def _sides(self) -> list[tuple[str, tuple[str, str]]]:
+        """[(node_name, (vm_id, mac)), ...] — one per endpoint, a then b."""
+        return [
+            (self.if_a.node_name, self._endpoints[0]),
+            (self.if_b.node_name, self._endpoints[1]),
+        ]
+
+    def _targets(self, outbound: str | None) -> list[tuple[str, tuple[str, str]]]:
+        sides = self._sides()
+        if outbound is None:
+            return sides
+        matched = [s for s in sides if s[0] == outbound]
+        if not matched:
+            raise ValueError(
+                f"outbound={outbound!r} is not an endpoint of this link "
+                f"({self.if_a.node_name}, {self.if_b.node_name})"
+            )
+        return matched
+
+    def impair(self, *, latency=None, jitter=None, bandwidth=None, loss=None,
+               reorder=None, corrupt=None, duplicate=None,
+               outbound: str | None = None) -> None:
+        """Apply tc netem impairments on the link's TAP devices.
+
+        Symmetric by default (both directions). Pass ``outbound=<node>`` to
+        degrade only that node's egress. Replaces any current impairment on
+        the targeted side(s); other params are not merged.
+        """
+        from rangectl.link_properties import build_netem_cmds
+        if self._backend is None:
+            raise RuntimeError("Link not wired to backend; deploy the topology first")
+        params = {k: v for k, v in dict(
+            latency=latency, jitter=jitter, bandwidth=bandwidth, loss=loss,
+            reorder=reorder, corrupt=corrupt, duplicate=duplicate,
+        ).items() if v is not None}
+        log.info("Link impair %s/%s <-> %s/%s: %s (outbound=%s)",
+                 self.if_a.node_name, self.if_a.interface_name,
+                 self.if_b.node_name, self.if_b.interface_name, params, outbound)
+        netns = getattr(self._backend, "_netns_name", None)
+        cmds: list[list[str]] = []
+        for node_name, (vm_id, mac) in self._targets(outbound):
+            tap = self._backend._find_tap_for_mac(vm_id, mac)
+            if not tap:
+                raise RuntimeError(
+                    f"no TAP found for {node_name} (vm={vm_id} mac={mac})")
+            cmds += build_netem_cmds(tap, netns, **params)
+            self._impairments[node_name] = dict(params)
+        self._backend.run_tc(cmds)
+
+    def clear(self, *, outbound: str | None = None) -> None:
+        """Remove impairments. ``outbound=<node>`` scopes to one direction."""
+        from rangectl.link_properties import build_clear_cmds
+        if self._backend is None:
+            raise RuntimeError("Link not wired to backend; deploy the topology first")
+        log.info("Link clear %s/%s <-> %s/%s (outbound=%s)",
+                 self.if_a.node_name, self.if_a.interface_name,
+                 self.if_b.node_name, self.if_b.interface_name, outbound)
+        netns = getattr(self._backend, "_netns_name", None)
+        cmds: list[list[str]] = []
+        for node_name, (vm_id, mac) in self._targets(outbound):
+            tap = self._backend._find_tap_for_mac(vm_id, mac)
+            if tap:
+                cmds += build_clear_cmds(tap, netns)
+            self._impairments[node_name] = {}
+        self._backend.run_tc(cmds)
+
+    def _reapply_impairments(self) -> None:
+        from rangectl.link_properties import build_netem_cmds
+        netns = getattr(self._backend, "_netns_name", None)
+        cmds: list[list[str]] = []
+        for node_name, (vm_id, mac) in self._sides():
+            params = self._impairments.get(node_name)
+            if not params:
+                continue
+            tap = self._backend._find_tap_for_mac(vm_id, mac)
+            if tap:
+                cmds += build_netem_cmds(tap, netns, **params)
+        if cmds:
+            self._backend.run_tc(cmds)
+
+    @property
+    def impairments(self) -> dict:
+        """Current impairment state, keyed by endpoint node name. A side with
+        no impairment maps to an empty dict."""
+        return {
+            self.if_a.node_name: dict(self._impairments.get(self.if_a.node_name, {})),
+            self.if_b.node_name: dict(self._impairments.get(self.if_b.node_name, {})),
+        }
 
 
 class Range:
@@ -641,7 +745,29 @@ class Range:
                 ssh_user="vyos" if r["os_type"] == "vyos" else "ubuntu",
             )
 
-        log.info("Reconnected to range '%s' (%d nodes)", name, len(node_rows))
+        # Rebuild links from the DB so impair/clear/down/up work cross-process.
+        # Each Link needs its bridge name, per-range backend, and (vm_id, mac)
+        # endpoints — the same wiring Engine._wire_link does at deploy.
+        from rangectl.engine import _mac_for
+        for lk in db.list_links(name):
+            if_a = InterfaceSpec(node_name=lk["node_a"],
+                                 interface_name=lk["iface_a"], ip=lk["ip_a"])
+            if_b = InterfaceSpec(node_name=lk["node_b"],
+                                 interface_name=lk["iface_b"], ip=lk["ip_b"])
+            link = Link(if_a, if_b, topology=topology)
+            link._backend = lvb
+            link._bridge_name = lk["bridge_name"]
+            link._db = db
+            link._topology_name = name
+            link._is_up = bool(lk.get("is_up", 1))
+            for side in (if_a, if_b):
+                vm_id = engine._vm_ids[(name, side.node_name)]
+                link._endpoints.append(
+                    (vm_id, _mac_for(name, side.node_name, side.interface_name)))
+            topology._links.append(link)
+
+        log.info("Reconnected to range '%s' (%d nodes, %d links)",
+                 name, len(node_rows), len(topology._links))
         return rng
 
     @classmethod
@@ -705,16 +831,18 @@ class Range:
     def __getitem__(self, node_name: str) -> LiveNode:
         return self._nodes[node_name]
 
-    def link(self, a: Any, b: Any) -> Link:
+    def link(self, a: Any, b: Any, **kwargs: Any) -> Link:
         """Two modes, picked by argument type:
 
         - **define** (``InterfaceSpec`` args): create a link on the internal
           topology — ``self.link(router.eth1["10.0.1.1/24"], t.eth1["10.0.1.2/24"])``.
+          Extra kwargs (``latency=``, ``bandwidth=``, ``loss=``, ...) set
+          definition-time impairment defaults.
         - **lookup** (node-name strings): return the existing link between two
           nodes for fault injection — ``lab.link("router", "target").down()``.
         """
         if isinstance(a, InterfaceSpec):
-            return self.topology.link(a, b)
+            return self.topology.link(a, b, **kwargs)
         log.info("Looking up link between %s and %s", a, b)
         for lnk in self.topology._links:
             if {lnk.if_a.node_name, lnk.if_b.node_name} == {a, b}:

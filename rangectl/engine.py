@@ -368,6 +368,9 @@ class Engine:
         log.info("Step 8: Wire topology links (DB + attach for hot-attach back-ends)")
         for link_idx, link in enumerate(topology._links):
             self._wire_link(topology, link, link_idx)
+            # Apply definition-time impairment defaults now that the TAPs exist.
+            if link._default_impairments:
+                link.impair(**link._default_impairments)
 
         # Dependency injection IS order-sensitive ("B's service depends on A being
         # ready"), so run it in DAG wave order.

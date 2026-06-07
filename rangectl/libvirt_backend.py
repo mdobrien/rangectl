@@ -524,6 +524,16 @@ class LibvirtBackend:
         _run(self._ip("ip", "link", "set", tap, "master", bridge), check=False)
         _run(self._ip("ip", "link", "set", tap, "up"), check=False)
 
+    def run_tc(self, cmds: list[list[str]]) -> None:
+        """Run pre-built tc commands (each a full argv, netns-prefixed by the
+        caller). Tolerant of failures — clearing a clean link or replacing an
+        absent qdisc is a no-op we don't want to surface as a hard error."""
+        for cmd in cmds:
+            res = _run(cmd, check=False)
+            if res.returncode != 0:
+                log.warning("tc command failed (%d): %s\n%s",
+                            res.returncode, " ".join(cmd), res.stderr)
+
     def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
         """Return the host TAP device name for the VM's NIC with the given MAC."""
         res = _run(self._virsh("domiflist", vm_id), check=False)

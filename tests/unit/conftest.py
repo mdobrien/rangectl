@@ -91,6 +91,28 @@ class MockBackend:
     def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
         self._record("attach_interface", vm_id, bridge, mac)
 
+    def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
+        self._record("_find_tap_for_mac", vm_id, mac)
+        return f"tap-{vm_id}"
+
+    def run_tc(self, cmds: list[list[str]]) -> None:
+        self._record("run_tc", cmds)
+
+    def tc_cmds(self) -> list[list[str]]:
+        """Flattened list of every tc command passed to run_tc (test helper)."""
+        out: list[list[str]] = []
+        for (args, _kw) in self.calls_of("run_tc"):
+            out.extend(args[0])
+        return out
+
+    def tc_taps(self) -> set[str]:
+        """Set of TAP device names that appeared in any tc command (test helper)."""
+        taps: set[str] = set()
+        for cmd in self.tc_cmds():
+            if "dev" in cmd:
+                taps.add(cmd[cmd.index("dev") + 1])
+        return taps
+
     def create_overlay(self, base_image: str, overlay_path: str) -> str:
         self._record("create_overlay", base_image, overlay_path)
         self.overlays[overlay_path] = base_image
