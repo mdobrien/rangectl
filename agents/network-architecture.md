@@ -2,6 +2,22 @@
 
 **Status:** Architecture validated. Feasibility spike passed all 5 phases on c5.metal / Ubuntu 22.04 / libvirt 8.0. See `scratch/scripts/libvirtd-ns-experiment.sh`.
 
+### Implementation Status vs This Document
+
+This document is the **target architecture**. Not everything is implemented yet. Key differences:
+
+| Feature | Doc Says | Current Implementation | Phase |
+|---------|----------|----------------------|-------|
+| Management namespace (three-tier) | Host → mgmt ns → range ns | Host → range ns (direct) | Phase 16 |
+| Host protection | Host never modified after setup | Host iptables/routes modified per range | Phase 16 |
+| QEMU user | `libvirt-qemu` (unprivileged) | `root` | Phase 18 |
+| `nsenter` for namespace access | Namespaces via `unshare`, use `nsenter` | Namespaces via `ip netns add`, use `ip netns exec` | — (works, different approach) |
+| SDK API | Range lifecycle class, OS drivers | Topology + Engine + Backend (internal wiring exposed) | Phase 15 |
+| Persistent ranges | `Range.connect()`, `Range.list()` | Ephemeral only (process-bound) | Phase 13 |
+| CLI | `rangectl list/exec/virsh/...` | No CLI (SDK only) | Phase 14 |
+
+**What IS implemented and matches this doc:** Per-range PID/net/mount namespaces, libvirtd-per-namespace, cgroup v2 resource limits + freeze/thaw, veth management network, per-range internet policy (iptables chains), clean bridge names in netns, qcow2 CoW overlays, DAG wave deploy, node state machine, health checks (L2), snapshot/restore, link toggle, mixed VM+container topologies, VyOS serial console bootstrap.
+
 ---
 
 ## 1. Overview
@@ -14,6 +30,7 @@ A VM testbed orchestration platform that deploys isolated "ranges" — sets of V
 - **No external dependencies beyond libvirt/QEMU.** The platform uses Linux kernel primitives directly for isolation and resource control. Libvirt is retained for VM lifecycle management.
 - **SDK-first.** The Python SDK is the only public interface. It must be simple enough that a new engineer has a working topology in 20 minutes.
 - **Lifecycle reliability above all.** The #1 lesson from GNS3: every operation must be deterministic. No "fire API call and hope." Nodes transition through explicit states, dependencies are resolved via DAG, and teardown is guaranteed clean.
+- **Host network is untouchable.** All per-range networking operations happen inside a persistent management namespace, never on the host. An orchestrator bug cannot damage host connectivity.
 
 ---
 
@@ -37,6 +54,8 @@ Each range gets its own libvirtd instance running inside the range's PID, networ
 - Domain XML — declarative VM definitions
 
 **What libvirt does NOT manage:** Bridges, TAPs, and network topology. The engine owns all networking directly. Libvirt domain XML uses `<interface type='bridge'><source bridge='mgmt-br'/></interface>` to attach to engine-managed bridges. Libvirt's own network definitions (`virsh net-define`) are never used — otherwise libvirt spawns its own dnsmasq and fights the engine's network model.
+
+**QEMU runs as `libvirt-qemu`, not root.** With AppArmor disabled (`security_driver = "none"`), the compensating control is running QEMU as the unprivileged `libvirt-qemu` user. The stock Ubuntu image registry (`/var/lib/libvirt/images`) is already group-readable by `libvirt-qemu`. See issue 20260528-1.
 
 ### 2.2 How It's Accessed
 
@@ -118,6 +137,10 @@ Feasibility spike on c5.metal / Ubuntu 22.04 / libvirt 8.0:
 │  │  cgroups   │ │  libvirtd  │ │  veth    │             │
 │  │            │ │  (per-ns)  │ │  pairs   │             │
 │  └────────────┘ └────────────┘ └──────────┘             │
+│  ┌─────────────────────────────────────────┐             │
+│  │  Management Namespace                   │             │
+│  │  (persistent, isolates host networking) │             │
+│  └─────────────────────────────────────────┘             │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -143,7 +166,7 @@ Range "my-network-lab"
 ├── Network Namespace
 │   ├── Management bridge (10.255.1.0/24)
 │   ├── Data plane bridges (user-defined topologies)
-│   └── Veth pair to host namespace (management access)
+│   └── Veth pair to management namespace (management access)
 │
 ├── PID Namespace
 │   └── libvirtd (PID 1, owns all QEMU processes)
@@ -180,7 +203,7 @@ DEFINED ──► PROVISIONING ──► READY ──► RUNNING ──► DESTR
 ```
 
 - **DEFINED:** Range spec exists, nothing allocated yet.
-- **PROVISIONING:** Namespaces created, cgroups allocated, qcow2 overlays created, libvirtd started, management network wired (veth pair + host route + iptables FORWARD rule established), QEMU processes starting.
+- **PROVISIONING:** Namespaces created, cgroups allocated, qcow2 overlays created, libvirtd started, management network wired (veth pair to management namespace + route + iptables FORWARD rule established in management namespace), QEMU processes starting.
 - **READY:** All VMs booted and passed health checks. Management network verified. Ansible/provisioning can begin.
 - **RUNNING:** Range is active. VMs are operational.
 - **FROZEN:** All processes suspended via cgroup freezer. Memory held, CPU released. Resume returns to RUNNING. See section 5.5 for caveats.
@@ -202,38 +225,61 @@ DEFINED ──► PROVISIONING ──► READY ──► RUNNING ──► DESTR
 - iptables blast radius is bounded. Errant rules from inside a range can't touch other ranges or the host.
 - VM-to-VM L2 leakage across ranges becomes structurally impossible, not just policy-impossible.
 
-**How it works:**
+**How it works — three-tier namespace model:**
 
 ```
-Host namespace                    Range "lab-1" namespace
-┌─────────────────┐              ┌───────────────────────────────┐
-│                 │  veth pair   │  mgmt-br (10.255.1.0/24)     │
-│  host routing   │◄────────────►│   ├── tap-vm1 (vm1 mgmt)     │
-│  table          │              │   ├── tap-vm2 (vm2 mgmt)     │
-│                 │              │   └── tap-vm3 (vm3 mgmt)     │
-│  routes:        │              │                               │
-│  10.255.1.0/24  │              │  data-br-1 (10.0.1.0/24)     │
-│   via veth-host │              │   ├── tap-vm1-data            │
-│                 │              │   └── tap-vm2-data            │
-│  10.255.2.0/24  │              │                               │
-│   via veth-host │              │  data-br-2 (10.0.2.0/24)     │
-└─────────────────┘              │   ├── tap-vm2-data2           │
-                                 │   └── tap-vm3-data            │
-Range "lab-2" namespace          └───────────────────────────────┘
-┌───────────────────────────────┐
-│  mgmt-br (10.255.2.0/24)     │
-│   ├── tap-vm1                 │
-│   └── tap-vm2                 │
-└───────────────────────────────┘
+Host namespace (NEVER modified after initial setup)
+│
+│  Single veth pair (created once)
+│  10.254.0.1/30
+│  One route: 10.255.0.0/16 via 10.254.0.2
+│  One FORWARD ACCEPT + one MASQUERADE
+│  ip_forward = 1
+│  (4 operations, done once, never touched again)
+│
+└────── veth ──────────────────────────────────────────────
+
+Management namespace (persistent, orchestrator's playground)
+│
+│  10.254.0.2/30, default route via host
+│
+│  Per-range veth pairs, routes, iptables chains:
+│  ├── veth-lab1 → 10.255.1.0/24 ──► lab-1 namespace
+│  ├── veth-lab2 → 10.255.2.0/24 ──► lab-2 namespace
+│  └── veth-lab3 → 10.255.3.0/24 ──► lab-3 namespace
+│
+│  All per-range network operations happen HERE,
+│  never on the host. A bug here cannot damage host networking.
+│
+└──────────────────────────────────────────────────────────
+
+Range "lab-1" namespace            Range "lab-2" namespace
+┌───────────────────────────┐     ┌───────────────────────────┐
+│  mgmt-br (10.255.1.0/24) │     │  mgmt-br (10.255.2.0/24) │
+│   ├── tap-vm1 (mgmt)     │     │   ├── tap-vm1 (mgmt)     │
+│   ├── tap-vm2 (mgmt)     │     │   └── tap-vm2 (mgmt)     │
+│   └── tap-vm3 (mgmt)     │     │                           │
+│                           │     │  data-br-1                │
+│  data-br-1 (10.0.1.0/24) │     │   ├── tap-vm1-data       │
+│   ├── tap-vm1-data        │     │   └── tap-vm2-data       │
+│   └── tap-vm2-data        │     └───────────────────────────┘
+│                           │
+│  data-br-2 (10.0.2.0/24) │
+│   ├── tap-vm2-data2       │
+│   └── tap-vm3-data        │
+└───────────────────────────┘
 ```
 
 - Each range's management network gets its own /24 (auto-assigned or user-specified).
-- A veth pair connects the range's management bridge to the host namespace.
-- The host has routes to every range's management subnet.
-- SSH runs from the host (or remotely via the host) and reaches all VMs across all ranges via the veth endpoints.
+- A veth pair connects each range to the **management namespace** (not the host).
+- The management namespace has routes to every range's management subnet.
+- The host connects to the management namespace via a single veth pair, created once at provisioning.
+- SSH from the host (or remotely via the host) reaches VMs by traversing: host → mgmt namespace → range namespace → VM. Extra hop is a veth pair in memory — microseconds of latency.
 - Data plane bridges are internal to the range — user defines the topology and the engine creates bridges and TAP interfaces accordingly.
 
-**No jump box required.** The host itself is the management gateway via the veth pairs.
+**No jump box required.** The host routes through the management namespace to reach all ranges.
+
+**Host protection:** The orchestrator never modifies host networking after initial setup. If an orchestrator bug corrupts iptables rules, routes, or interfaces, it corrupts the management namespace only. Host SSH and host internet are unaffected. Recovery: kill the management namespace, recreate it from orchestrator state, reconnect ranges. Seconds, not a reboot.
 
 ### 5.2 PID Namespace
 
@@ -245,6 +291,8 @@ Each range runs inside its own PID namespace with libvirtd as PID 1. All QEMU pr
 2. **Process isolation:** QEMU processes in one range cannot see or signal processes in another range. **Validated in Phase E — killing range B left range A completely unaffected.**
 
 **Important:** Reap by killing libvirtd's host-PID, not the unshare wrapper process. The unshare process is in the host namespace; libvirtd is PID 1 inside the ns.
+
+**Discovering libvirtd's host PID:** After `unshare --fork`, the supervisor records the child PID. That child's first descendant is libvirtd. Alternatively, read `/proc/<unshare-pid>/task/<unshare-pid>/children` to find it. The engine should record this PID at launch time so `destroy()` doesn't have to rediscover it.
 
 ### 5.3 Mount Namespace (Required)
 
@@ -292,7 +340,7 @@ Freeze/thaw is valuable but has a known limitation: **clock skew on thaw.**
 
 When a range is frozen, vCPUs are paused. On thaw, wall time has jumped but guest monotonic time hasn't. Guests using kvm-clock (Linux default) handle the kernel-level clock adjustment. However, userspace services with time-sensitive behavior can break: TLS certificate validation, Kerberos tickets, NTP-locked services.
 
-**Recommendation:** Freeze/thaw is best suited for short-duration pauses (atomic snapshots, brief oversubscription). For long pauses (hours+), snapshot-then-destroy and restore-from-snapshot is cleaner. The SDK supports a post-thaw hook for time resynchronization:
+**Recommendation:** Freeze/thaw is best suited for short-duration pauses (atomic snapshots, brief oversubscription). For long pauses (hours+), snapshot-then-destroy and restore-from-snapshot is cleaner. The SDK supports a post-thaw hook for time resynchronization. **The hook is blocking** — the range stays in FROZEN→RUNNING transition until the hook returns, preventing races with health checks or user commands:
 
 ```python
 range.on_thaw(lambda vm: vm.exec("chronyc makestep"))
@@ -313,6 +361,11 @@ range.on_thaw(lambda vm: vm.exec("chronyc makestep"))
 The empirically validated recipe for launching a range. ~30 lines of shell, directly translatable to Python.
 
 ```
+Step 0:  Attach to per-range cgroup (before unshare):
+           echo $$ > /sys/fs/cgroup/<range-name>/cgroup.procs
+         This ensures all descendants (libvirtd + QEMU) are born into
+         the cgroup. Must happen before unshare, not after.
+
 Step 1:  unshare --pid --fork --net --mount --uts \
            --propagation private --mount-proc
 
@@ -327,15 +380,18 @@ Step 2:  Bind-mount per-range directories:
            mount --bind /ranges/<name>/lib-libvirt/swtpm    /var/lib/libvirt/swtpm
          DO NOT bind over /var/lib/libvirt/images (shared registry).
 
-Step 3:  Block dbus:
-           mount --bind <empty-dir> /run/dbus
+Step 3:  Block dbus (guard for hosts where /run/dbus may not exist):
+           [[ -d /run/dbus ]] && mount --bind <empty-dir> /run/dbus
 
 Step 4:  Per-range qemu.conf:
            security_driver = "none"
            stdio_handler = "file"
            dynamic_ownership = 0
-           user = "root"
-           group = "root"
+           user = "libvirt-qemu"
+           group = "libvirt-qemu"
+         Rationale: with AppArmor disabled, running QEMU as the unprivileged
+         libvirt-qemu user (not root) is the primary compensating control.
+         The stock Ubuntu image registry is already group-readable by this user.
 
 Step 5:  exec /usr/sbin/libvirtd \
            --config /ranges/<name>/libvirtd.conf \
@@ -346,42 +402,80 @@ Step 5:  exec /usr/sbin/libvirtd \
 
 ## 7. Networking Architecture
 
-### 7.1 Management Network
+### 7.1 Management Namespace
 
-Every range gets an auto-provisioned management network:
+A persistent network namespace that sits between the host and all range namespaces. Created once during host provisioning, never torn down. All per-range networking operations happen here — the host is never modified after initial setup.
+
+**Initial setup (done once, by Ansible/cloud-init at host provisioning):**
+
+```bash
+# Create the management namespace
+ip netns add mgmt
+
+# Create veth pair between host and mgmt namespace
+ip link add veth-mgmt-host type veth peer name veth-mgmt-ns
+ip link set veth-mgmt-ns netns mgmt
+
+# Assign addresses
+ip addr add 10.254.0.1/30 dev veth-mgmt-host
+ip link set veth-mgmt-host up
+ip netns exec mgmt ip addr add 10.254.0.2/30 dev veth-mgmt-ns
+ip netns exec mgmt ip link set veth-mgmt-ns up
+ip netns exec mgmt ip link set lo up
+
+# Host route to all management subnets (once, never changes)
+ip route add 10.255.0.0/16 via 10.254.0.2
+
+# Host forwarding + NAT (once, never changes)
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -A FORWARD -i veth-mgmt-host -j ACCEPT
+iptables -A FORWARD -o veth-mgmt-host -m state \
+  --state RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -A POSTROUTING -s 10.255.0.0/16 \
+  -o $(ip route show default | awk '{print $5}') -j MASQUERADE
+
+# Default route inside mgmt namespace (for internet egress)
+ip netns exec mgmt ip route add default via 10.254.0.1
+```
+
+After this, the host network config is locked. The orchestrator does all subsequent work inside the management namespace.
+
+### 7.2 Per-Range Management Network
+
+Every range gets an auto-provisioned management network, wired to the management namespace (not the host):
 
 1. A Linux bridge (`mgmt-br`) inside the range's network namespace.
 2. Every VM's first interface connects to this bridge.
-3. A veth pair links the bridge to the host namespace.
-4. The host has a route to the range's management subnet.
-5. An iptables FORWARD ACCEPT rule for the management CIDR on the host (without this, the host kernel drops the first SSH SYN even with a route present).
+3. A veth pair links the range to the management namespace.
+4. A route in the management namespace points to the range's management subnet.
+5. An iptables FORWARD ACCEPT rule in the management namespace for the management CIDR.
 6. Management IPs are auto-assigned from the subnet.
 
 This is transparent to the user — they define a range with `mgmt_network="10.255.1.0/24"` and everything is wired automatically.
 
-### 7.2 Provisioning Order of Operations
+### 7.3 Provisioning Order of Operations
 
-**Critical:** The management network infrastructure must be established before VMs boot. Health checks and post-boot configuration (Ansible, SSH) require the host to have a route and forwarding rules into the range's management subnet. The ordering is:
+**Critical:** The management network infrastructure must be established before VMs boot. Health checks and post-boot configuration (Ansible, SSH) require the management namespace to have a route into the range's management subnet. The ordering is:
 
 ```
-Step 1: Create network namespace              ─┐
-Step 2: Create mgmt bridge in namespace        │ Infrastructure setup
-Step 3: Create veth pair                       │ (seconds, deterministic,
-Step 4: Add host route to mgmt subnet         │  no VM involvement)
-Step 5: Add iptables FORWARD rule for CIDR    │
-Step 6: Start libvirtd in namespace            ─┘
-Step 7: Start QEMU processes (VMs boot)        ─ VM startup
-Step 8: Health checks confirm VMs reachable    ─ Readiness verification
-Step 9: Post-boot configuration (Ansible)      ─ User-defined setup
+Step 1: Create range network namespace                    ─┐
+Step 2: Create mgmt bridge in range namespace              │ Infrastructure setup
+Step 3: Create veth pair (mgmt ns ↔ range ns)             │ (seconds, deterministic,
+Step 4: Add route in mgmt namespace to range subnet       │  no VM involvement,
+Step 5: Add iptables FORWARD rule in mgmt namespace       │  host never touched)
+Step 6: Start libvirtd in range namespace                  ─┘
+Step 7: Start QEMU processes (VMs boot)                    ─ VM startup
+Step 8: Health checks confirm VMs reachable                ─ Readiness verification
+Step 9: Post-boot configuration (Ansible)                  ─ User-defined setup
 ```
 
-Steps 1-6 are pure infrastructure plumbing that completes in seconds. Step 7 starts VMs. Steps 8-9 happen after boot — health checks verify the VM is SSH-reachable on the management interface, then Ansible runs post-boot configuration. This supports workflows where VMs need post-boot commands (e.g., VyOS configuration that must be applied after the OS is up).
+Steps 1-6 are pure infrastructure plumbing that completes in seconds. All network operations in steps 3-5 happen inside the management namespace — the host is not modified. Step 7 starts VMs. Steps 8-9 happen after boot — health checks verify the VM is SSH-reachable on the management interface, then Ansible runs post-boot configuration. This supports workflows where VMs need post-boot commands (e.g., VyOS configuration that must be applied after the OS is up).
 
-### 7.3 Cloud-Init: Default Route and DNS
+### 7.4 Cloud-Init: Default Route and DNS
 
 VMs need a default route and nameservers configured inside the guest. Cloud-init handles this for images that support it. For images that don't (or where cloud-init is unreliable), post-boot Ansible configuration applies the settings. This is a per-VM concern, not a namespace concern.
 
-### 7.4 Data Plane Network
+### 7.5 Data Plane Network
 
 The user defines the topology — which VMs connect to which, on which interfaces, with which subnets. The engine creates bridges and TAP interfaces inside the range's network namespace accordingly. Libvirt handles TAP creation as part of VM startup since it's running inside the namespace.
 
@@ -398,16 +492,20 @@ topo.link(router.eth2, client.eth0, network="10.0.2.0/24")
 
 This creates two data plane bridges inside the namespace, with TAP interfaces for each VM endpoint.
 
-### 7.5 Internet Access Policy
+**Verification note:** Libvirt creates TAPs via netlink from inside the namespace. The host's system-level AppArmor profile for libvirt must permit netlink operations from inside a netns. Expected to work but should be verified in the networking spike.
 
-Internet access is controlled via iptables/nftables rules on the host, applied per range using dedicated chains. The veth pair is the choke point — all traffic to/from a range flows through it.
+### 7.6 Internet Access Policy
+
+Internet access is controlled via iptables/nftables rules in the **management namespace**, applied per range using dedicated chains. The veth pair between the management namespace and each range is the choke point.
 
 | Policy | Behavior |
 |---|---|
-| `none` | No internet. VMs can reach each other and host can reach VMs for management. Default. |
-| `full` | NAT (masquerade) all range traffic out through host's internet connection. |
+| `none` | No internet. VMs can reach each other and management namespace can reach VMs. Default. |
+| `full` | Traffic from the range is forwarded through the management namespace to the host and NATed out. |
 
-**Implementation:** Each range gets a dedicated iptables chain (`RANGE-<name>`). Tearing down a range flushes and deletes only its chain — no risk of affecting other ranges.
+**Egress path:** Range VM → range mgmt bridge → veth to mgmt namespace → mgmt namespace routing → veth to host → host MASQUERADE → internet. The host's single MASQUERADE rule (set up once during provisioning) handles all ranges.
+
+**Implementation:** Each range gets a dedicated iptables chain (`RANGE-<name>`) **inside the management namespace**. Tearing down a range flushes and deletes only its chain within the management namespace — the host's iptables are never touched.
 
 ```python
 range = Range("my-lab", internet="full")
@@ -431,7 +529,9 @@ Make the management subnets (10.255.0.0/16) routable from the dev's machine. The
 
 **On-prem with gateway access:** Add a static route on the network gateway: `10.255.0.0/16 via <host-ip>`.
 
-**On-prem without gateway access:** WireGuard VPN. Dev installs WireGuard, gets a config file, connects. All management subnets routed through the tunnel. Dev types `ssh user@10.255.1.10` and it works. One-time client setup.
+**On-prem without gateway access:** WireGuard VPN. Dev installs WireGuard, gets a config file, connects. All management subnets routed through the tunnel. Dev types `ssh user@10.255.1.10` and it works. One-time client setup. WireGuard can optionally run inside the management namespace instead of on the host, so even VPN traffic is isolated from host networking.
+
+**Dev access path:** Dev laptop → host → veth to mgmt namespace → mgmt namespace routing → veth to range namespace → range mgmt bridge → VM. The extra hop through the management namespace is a veth pair in memory — microseconds of latency, invisible to the user.
 
 ```bash
 # From dev's laptop — all transparent:
@@ -568,7 +668,7 @@ DEFINED ──► PROVISIONING ──► BOOTING ──► READY ──► LINKE
 
 A node is not "ready" until a user-defined (or default) health check passes. This replaces GNS3's pattern of "API returned 200, therefore the node is up."
 
-Health checks run from the host via the management network (SSH over veth route). The management network infrastructure (veth pair + host route + FORWARD rule) is established during range provisioning, before any VMs boot.
+Health checks run from the host via the management network (SSH traverses host → management namespace → range namespace → VM). The per-range management network infrastructure (veth pair and route in the management namespace) is established during range provisioning, before any VMs boot.
 
 ```python
 # Default: SSH port reachable on management interface
@@ -728,7 +828,7 @@ range.deploy()
 # List all ranges
 rangectl list
 
-# Inspect a range's network (enters netns)
+# Inspect a range's network (enters all namespaces)
 rangectl exec lab-1 -- ip link show
 rangectl exec lab-1 -- brctl show
 
@@ -741,6 +841,8 @@ rangectl freeze lab-1
 rangectl thaw lab-1
 rangectl destroy lab-1
 ```
+
+**Implementation note:** `rangectl exec` uses `nsenter -t <libvirtd-host-pid> -a -- <cmd>`, NOT `ip netns exec`. The namespaces are created via `unshare`, not `ip netns add`, so there is no `/var/run/netns/<name>` symlink and `ip netns` doesn't know they exist.
 
 ---
 
@@ -764,11 +866,14 @@ The platform targets AWS EC2 bare metal instances with KVM support. **Metal inst
 
 ### 12.2 Host Requirements
 
+- **Ubuntu 22.04 LTS** (pinned for v1 — see note on modular daemons below)
 - Linux kernel 5.10+ (cgroups v2, all namespace types)
 - KVM enabled (`/dev/kvm` accessible)
 - QEMU 6.0+
-- libvirt 8.0+ (validated on this version)
+- libvirt 8.0+ monolithic mode (validated on this version)
 - Python 3.10+
+
+**Modular daemon note:** Ubuntu 24.04 / Debian 12 ship libvirt 9.0+ with a modular daemon split (`virtqemud` + `virtnetworkd` + `virtstoraged` + `virtlogd` + `virtsecretd`). The supervisor would need to start multiple daemons, and the bind-mount table would expand. Not a blocker but untested. Pinning to Ubuntu 22.04's monolithic `libvirtd` for v1; modular daemon support is a follow-up.
 
 ---
 
@@ -792,13 +897,14 @@ Code-level estimate of what changes:
 | `libvirt_backend.py` | ~50% rewrite — bridges/TAPs move into NetnsManager, libvirtd lifecycle becomes supervisor's job, `create_vm` issues `virsh -c qemu+unix://<per-range-socket>` | Major |
 | `engine.py` | ~20% — `_deploy_node` calls netns-aware backend; allocation logic mostly survives | Moderate |
 | New: `supervisor.py` | PID-1 process, namespace setup, libvirtd launch | New |
-| New: `netns.py` | ip netns + veth + routes + iptables chain | New |
+| New: `mgmt_namespace.py` | Persistent management namespace, per-range veth/route/iptables, host isolation | New |
+| New: `netns.py` | Per-range network namespace creation, bridge setup | New |
 | New: `cgroup.py` | Cgroup creation, limits, freeze/thaw | New |
 | Removed | Global bridge name hashing, host-IP collision avoidance | Deleted |
 
 Topology DAG, state machine, image registry, cloud-init builders, SSH plumbing, and tests carry over.
 
-**Timeline:** ~2 weeks of focused work.
+**Timeline:** ~2 weeks of focused work. This estimate assumes Ubuntu 22.04 with monolithic libvirtd 8.0 (what the spike validated). Modular daemon support on Ubuntu 24.04+ would add scope.
 
 ---
 
@@ -806,9 +912,9 @@ Topology DAG, state machine, image registry, cloud-init builders, SSH plumbing, 
 
 Items validated conceptually but not yet tested end-to-end:
 
-- **Networking inside the netns:** Bridges + veth + host route + iptables NAT. Standard Linux plumbing, no novel risk. The Topo 3 MASQUERADE + DNS work directly informs this.
+- **Networking inside the netns:** Management namespace setup, per-range veth pairs, bridges, iptables chains. Standard Linux plumbing, no novel risk. The Topo 3 MASQUERADE + DNS work directly informs this. The management namespace adds one layer of indirection but uses the same primitives.
 - **Cgroup v2 attachment:** Supervisor writes its own PID into a per-range cgroup before `unshare` so all descendants are in the cgroup. Standard.
-- **AppArmor:** Punted via `security_driver = "none"`. Acceptable for single-tenant testbed. Would need revisiting for untrusted/multi-tenant ranges.
+- **AppArmor:** Punted via `security_driver = "none"`. Compensated by running QEMU as `libvirt-qemu` (not root). Acceptable for single-tenant testbed. Would need revisiting for untrusted/multi-tenant ranges. See issue 20260528-1.
 - **Long-term stability:** Spike booted VMs and killed them. Did not run for hours or under load.
 - **PTY serial in domain XML:** `virsh console` requires `<serial type='pty'><target port='0'/></serial>` in domain XML. Already present in current code — preserve it.
 
@@ -846,6 +952,10 @@ Containers are moved into the range's network namespace after creation.
 
 EC2 nested KVM on Nitro-based instances (c5, m5, c6i) is region-limited and instance-type-limited. Once AWS improves coverage, this could be a cost-effective option for small ranges. Deferred from v1.
 
+### 15.4 Libvirt Modular Daemon Support (Ubuntu 24.04+)
+
+Ubuntu 24.04+ ships libvirt 9.0+ with a modular daemon split (`virtqemud` + `virtnetworkd` + `virtstoraged` + `virtlogd` + `virtsecretd`). The supervisor would need to start multiple daemons and the bind-mount table would expand. v1 pins to Ubuntu 22.04 monolithic `libvirtd`.
+
 ---
 
 ## 16. Summary: What Makes This Different from GNS3
@@ -866,3 +976,4 @@ EC2 nested KVM on Nitro-based instances (c5, m5, c6i) is region-limited and inst
 | Snapshot | Per-node, inconsistent timing | Freeze → snapshot all → thaw — atomic consistency across entire range |
 | VM management | N/A | Libvirt per namespace — virsh scoped per range, all debugging tooling preserved |
 | Range isolation | N/A | Four kernel primitives (netns + pidns + mntns + cgroup), empirically validated |
+| Host protection | N/A | Management namespace — orchestrator bugs cannot damage host networking |

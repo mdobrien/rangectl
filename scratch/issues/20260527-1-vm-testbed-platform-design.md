@@ -382,13 +382,334 @@ Plus new tests:
 - **Unit tests**: Range constructor with resources/internet, freeze/thaw API, internet toggle
 - **Integration tests**: full Topo 1-7 regression + namespace isolation + freeze/thaw + internet policy
 
-### Phase 13: Windows Support
+---
+
+**Build order for Phases 13-16:** Phase 13 → Phase 15 → Phase 14 → Phase 16
+
+Phase 15 (SDK polish) redesigns the public API — Range lifecycle class, OS drivers, clean interface. Phase 14 (CLI) wraps the SDK. Building CLI before the SDK redesign means rewriting it, so Phase 15 must come first. Phase 13 (persistent ranges) is a prerequisite for both.
+
+---
+
+### Phase 13: Persistent Ranges
+`Range.connect(name)` and `Range.list()` so ranges survive process exit. Full design: `20260529-10-phase13-persistent-ranges.md`.
+
+- Persist engine bookkeeping (VM IDs, mgmt IPs, backend params) to StateDB
+- `Range.connect()` reads StateDB + range.json, rebuilds LiveNode handles with OS drivers
+- `Range.list()` returns status: RUNNING, FROZEN, ORPHANED
+- Stale state detection and cleanup
+- **Unit tests**: connect with mocked state, list, stale detection
+- **Integration tests**: deploy → exit → reconnect → run → destroy
+
+### Phase 15: SDK Polish (run BEFORE Phase 14)
+Redesign the user-facing API. Full design: `20260529-12-phase15-sdk-polish.md`.
+
+**Range lifecycle class** — structured definition with explicit methods:
+- `define_nodes()` → `define_network()` → boot → `install_software()` → dep check → `configure_os()` → `verify()` → READY
+- `verify()` is required — deploy fails if not overridden
+
+**OS driver abstraction** — per-OS behavior behind a clean interface:
+- `OSDriver` base class — `put()` and `exec()` required, everything else optional
+- Shipped: LinuxDriver (Paramiko), VyOSDriver (Paramiko), ContainerDriver (docker), WindowsDriver (skeleton)
+- Extensible via `OSType.register("junos", JunosDriver)`
+- Auth handled by engine, drivers receive authenticated transports
+
+**API cleanup:**
+- Users never import Engine, LibvirtBackend, or StateDB
+- `.run()` returns stdout, `.exec()` returns ExecResult, `.put()` for files, `.put_dir()` for dirs
+- Node power ops: stop/start/restart/status
+- ImageBuilder.build() implemented
+- Refactor all integration tests (Topo 1-7) to use Range subclass API
+
+- **Unit tests**: lifecycle method ordering, OS driver dispatch, ImageBuilder
+- **Integration tests**: full lifecycle via Range subclass, refactored Topo 1-7
+
+### Phase 14: CLI (run AFTER Phase 15)
+Command-line tool for operating on deployed ranges. Full design: `20260529-11-phase14-cli.md`.
+
+**Depends on:** Phase 13 (Range.connect) + Phase 15 (stable SDK with OS drivers)
+
+**Commands:** list, status, exec, upload, ssh-config, virsh, netns, logs, qemu-log, ps, net, node stop/start/restart, freeze, thaw, snapshot, restore, internet, destroy, images, deploy (YAML secondary path)
+
+- `argparse`, no external deps
+- `--yaml` for machine-readable output
+- SSH keys transparent (per-range ed25519, managed by engine)
+- Node power ops also in SDK
+
+- **Unit tests**: arg parsing, output formatting, error handling
+- **Integration tests**: list, status, exec, node stop/start, destroy
+
+### Phase 16: Management Namespace (Host Protection)
+The architecture doc (v3) describes a three-tier namespace model: host → management namespace → range namespaces. Currently, veth pairs go directly from range namespaces to the host. All per-range iptables rules, routes, and veth pairs are created on the host. An orchestrator bug can corrupt host networking.
+
+This phase adds the persistent management namespace as an isolation layer. After initial setup (one veth pair + one route + one MASQUERADE on the host), the host network config is locked. All per-range operations happen inside the management namespace.
+
+**What changes:**
+- New: `rangectl/mgmt_namespace.py` — create/destroy persistent management namespace, host↔mgmt veth pair
+- `rangectl/netns.py` — per-range veth pairs connect to mgmt namespace (not host)
+- `rangectl/internet.py` — iptables chains move into mgmt namespace
+- `rangectl/supervisor.py` — routes added in mgmt namespace, not host
+- Host setup: one-time provisioning script (4 operations: veth, route, FORWARD, MASQUERADE)
+
+**Host network operations after initial setup: zero.** Recovery from orchestrator bug: kill mgmt namespace, recreate, reconnect ranges. Seconds, not a reboot.
+
+- **Unit tests**: mgmt namespace create/destroy, per-range veth routing through mgmt ns
+- **Integration tests**: deploy range, verify host iptables untouched, kill mgmt ns + recover
+
+### Phase 17: Performance Benchmarking & Optimization
+Establish baselines and identify bottlenecks. No premature optimization — measure first, then fix what matters.
+
+**Benchmarks to establish:**
+- Range deploy time: time from `deploy()` to READY (breakdown: namespace setup, libvirtd start, VM boot, cloud-init, SSH ready, dependency install, verify)
+- Range destroy time: time from `destroy()` to clean
+- Multi-range: deploy N ranges simultaneously, measure scaling behavior
+- Snapshot/restore cycle time
+- Freeze/thaw cycle time (freeze → verify frozen → thaw → verify resumed)
+- Node boot time by OS type (Ubuntu, VyOS, container)
+- SSH exec latency (host → mgmt ns → range ns → VM)
+- File transfer throughput (put/put_dir via SFTP)
+- Memory overhead per range (libvirtd RSS + QEMU RSS)
+- Disk overhead per range (overlays, seed ISOs, per-range state dirs)
+- Maximum concurrent ranges on c5.metal (96 vCPU, 192GB RAM)
+
+**Optimization candidates (measure before touching):**
+- Parallel VM boot within a wave (already threaded — verify it's actually parallel)
+- Cloud-init vs pre-baked image boot time comparison
+- Overlay creation time at scale (100+ overlays)
+- libvirtd startup time in namespace
+- SSH connection pooling (reuse Paramiko connections across exec calls)
+- StateDB write batching during deploy
+
+**Deliverables:**
+- `scratch/scripts/benchmark.py` — repeatable benchmark suite
+- Baseline numbers documented in a benchmark results file
+- Identified bottlenecks with evidence (not guesses)
+- Targeted fixes for top 2-3 bottlenecks
+
+- **No unit tests** — this is measurement, not new functionality
+- **Integration tests**: benchmark suite runs on EC2, produces results
+
+### Phase 18: Security Hardening — QEMU Unprivileged
+QEMU currently runs as root inside the PID namespace. With AppArmor disabled, a guest escape gives root inside the namespace. This phase changes QEMU to run as `libvirt-qemu` — the stock unprivileged user.
+
+**Changes:**
+- `rangectl/supervisor.py` — qemu.conf: `user = "libvirt-qemu"`, `group = "libvirt-qemu"`
+- `rangectl/libvirt_backend.py` — `chown libvirt-qemu` on overlay files and seed ISOs
+- `rangectl/supervisor.py` — per-range dirs need `libvirt-qemu` write access (logs, cache, runtime state)
+- Verify: VyOS serial console PTYs still work (libvirtd creates PTY as root, QEMU accesses as libvirt-qemu)
+- Verify: snapshot/restore still works with unprivileged QEMU
+
+**Risk:** Low. File permission changes only. No architectural changes. Rollback: change user back to root.
+
+- **Unit tests**: verify qemu.conf content, file permission helpers
+- **Integration tests**: full Topo 1-7 regression with QEMU as libvirt-qemu
+
+### Phase 19: Link Properties (WAN Simulation)
+Runtime link impairment via `tc netem` inside the range netns. Every link can be degraded on the fly — latency, bandwidth, loss, jitter, reordering, corruption, duplication. All native Linux, no external deps.
+
+**SDK:**
+```python
+# At definition time
+lab.link(router.eth1["10.0.1.1/24"], target.eth1["10.0.1.2/24"],
+         latency="50ms", bandwidth="10mbit", loss="2%")
+
+# At runtime — modify live links
+link = lab.link("router", "target")
+link.impair(latency="100ms", bandwidth="1mbit", loss="5%", jitter="20ms")
+link.impair(reorder="25%", corrupt="1%")
+link.clear()  # remove all impairments, restore clean link
+```
+
+**Implementation:**
+- `tc qdisc add dev <iface> root netem delay 50ms` (and variants) inside the range netns
+- Applied per-interface — can be asymmetric (degraded in one direction only)
+- `link.impair()` replaces current qdisc; `link.clear()` removes it
+- Integrates with link.down()/up() — impairments are re-applied after link.up()
+
+**Parameters:**
+| Param | tc netem | Example |
+|-------|---------|---------|
+| `latency` | `delay` | `"50ms"`, `"100ms"` |
+| `jitter` | `delay X Yms` | `"10ms"` (variation around latency) |
+| `bandwidth` | `rate` (tbf parent) | `"10mbit"`, `"1gbit"` |
+| `loss` | `loss` | `"5%"`, `"0.1%"` |
+| `reorder` | `reorder` | `"25%"` |
+| `corrupt` | `corrupt` | `"1%"` |
+| `duplicate` | `duplicate` | `"1%"` |
+
+- **Unit tests**: impair/clear generate correct tc commands (mocked)
+- **Integration tests**: impair a link, measure latency increase via ping, clear and verify restored
+
+### Phase 20: Hub & Switch Node Types
+L2 network devices as first-class node types. No VM, no container — just a bridge with specific forwarding behavior inside the range netns.
+
+**SDK:**
+```python
+# Switch — default Linux bridge behavior (MAC learning, per-port forwarding)
+sw = lab.switch("core-switch", ports=8)
+
+# Hub — all traffic flooded to all ports (disable MAC learning)
+hub = lab.hub("monitor-hub", ports=4)
+
+# Wire them like any other node
+lab.link(router.eth1["10.0.1.1/24"], sw.port0)
+lab.link(target.eth1["10.0.1.2/24"], sw.port1)
+lab.link(sw.port2, hub.port0)  # switch uplink to hub
+lab.link(ids_sensor.eth1, hub.port1)  # IDS sees all traffic via hub
+```
+
+**Implementation:**
+- Switch: standard Linux bridge (`ip link add <name> type bridge`) — already what data bridges are
+- Hub: Linux bridge with MAC learning disabled (`bridge link set dev <port> learning off` + `flood on`) — all frames flooded to all ports
+- No boot time, no health check, no state machine — they're instant infrastructure
+- Ports are just bridge interfaces, not TAPs — VMs attach TAPs to them as usual
+
+- **Unit tests**: switch/hub creation, port assignment, MAC learning flag
+- **Integration tests**: hub floods traffic to IDS sensor port, switch does not
+
+### Phase 21: Port Mirroring, SPAN & Packet Capture
+Observe traffic on any interface or bridge inside a range. Two capabilities: mirroring (copy traffic to another port) and capture (write pcap files).
+
+**SDK — Packet capture:**
+```python
+# Capture on a specific node interface
+cap = lab.capture("router", "eth1")         # returns a Capture handle
+cap = lab.capture("router", "eth1",
+                  filter="tcp port 80",      # BPF filter
+                  output="/tmp/http.pcap")   # write to file
+
+# Stop and get the pcap
+cap.stop()
+pcap_path = cap.file                        # path to pcap file
+
+# Capture on a bridge (sees all traffic on the segment)
+cap = lab.capture_bridge("data-0")
+```
+
+**SDK — Port mirroring:**
+```python
+# Mirror all traffic on a link to a sensor node
+lab.mirror("router", "eth1", to="ids-sensor", port="eth0")
+
+# Mirror with direction filter
+lab.mirror("router", "eth1", to="ids-sensor", port="eth0",
+           direction="ingress")  # or "egress" or "both"
+
+# Remove mirror
+lab.unmirror("router", "eth1")
+```
+
+**Implementation:**
+- Capture: `ip netns exec <ns> tcpdump -i <iface> -w <file> <filter>` as a background process. Capture handle tracks the PID and stops it.
+- Mirror (Linux bridge): `tc qdisc add dev <src> ingress && tc filter add dev <src> parent ffff: matchall action mirred egress mirror dev <dst>` inside the netns
+- Mirror (OVS, if bridge driver abstraction exists): native `ovs-vsctl -- set Bridge <br> mirrors=@m ...`
+- Capture files stored in `/ranges/<name>/captures/`
+- Range destroy cleans up running captures
+
+- **Unit tests**: capture start/stop commands (mocked), mirror tc rules
+- **Integration tests**: capture pcap on link, verify packets present; mirror traffic to sensor, verify sensor sees it
+
+### Phase 22: Per-Range Services (Extensible, DNS First)
+Lightweight services that run inside the range's netns on the mgmt bridge. Extensible framework — DNS is the first implementation, others (DHCP, NTP, syslog) follow the same pattern.
+
+**SDK:**
+```python
+class MyLab(Range):
+    name = "my-lab"
+    
+    # Built-in services — declared on the range
+    dns = True                    # per-range dnsmasq on mgmt bridge
+    # dhcp = True                 # future
+    # ntp = True                  # future — solves freeze/thaw clock skew
+    # syslog = True               # future — centralized logging
+
+    def define_nodes(self):
+        self.target = self.node("target", image="ubuntu-22.04")
+        self.web = self.node("web", image="ubuntu-22.04")
+
+    def verify(self):
+        # Nodes can resolve each other by name
+        self["target"].run("ping -c 1 web.my-lab")
+        self["web"].run("ping -c 1 target.my-lab")
+```
+
+**DNS implementation:**
+- dnsmasq runs inside the range netns, listening on the mgmt bridge gateway IP (.254)
+- Auto-registers all nodes: `<node-name>.<range-name>` → mgmt IP
+- Cloud-init configures VMs to use .254 as nameserver (already sets gateway, just add DNS)
+- VyOS: `set system name-server <.254>` via serial console
+- Containers: `--dns <.254>` or resolv.conf injection
+- dnsmasq upstream: uses host DNS (via mgmt ns → host veth) when `internet="full"`, no upstream when `internet="none"`
+
+**Extensible framework:**
+```python
+class RangeService:
+    """Base class for per-range services."""
+    def start(self, netns_name, mgmt_bridge, mgmt_subnet): raise NotImplementedError
+    def stop(self): raise NotImplementedError
+    def health_check(self) -> bool: raise NotImplementedError
+
+class DNSService(RangeService):
+    """dnsmasq — auto-registers node hostnames."""
+    def start(self, netns_name, mgmt_bridge, mgmt_subnet):
+        # ip netns exec <ns> dnsmasq --interface=mgmt-br --bind-interfaces ...
+    def register_node(self, hostname, ip):
+        # write to /ranges/<name>/dnsmasq.hosts, SIGHUP dnsmasq
+    def stop(self):
+        # kill dnsmasq PID
+
+# User-defined services follow the same pattern
+class SyslogService(RangeService):
+    def start(self, netns_name, mgmt_bridge, mgmt_subnet):
+        # rsyslogd inside the netns
+```
+
+**Service lifecycle:** Services start after namespace setup but before VM boot (so DNS is available during cloud-init). Services stop during range destroy (after VMs are killed).
+
+- **Unit tests**: service start/stop commands (mocked), DNS hostname registration, cloud-init DNS config
+- **Integration tests**: deploy range with DNS, verify nodes resolve each other by name, verify DNS works with internet="none" and internet="full"
+
+### Phase 23: Windows Support
 - UEFI boot, virtio drivers
 - cloudbase-init / unattend.xml generation
 - `powershell()` on Node/DependencySet
 - WinRM for post-boot config
+- WindowsDriver implementation (currently skeleton)
 - **Unit tests**: Windows-specific dep resolution
 - **Integration tests**: Windows VM boot, cloudbase-init, WinRM
+
+### Phase 24: Parallel Test Isolation
+**Issue**: `20260601-5-parallel-test-isolation.md` (full root-cause analysis)
+
+Production multi-range on one host is already non-overlapping (single shared
+StateDB allocates unique mgmt subnets; `topologies.name` PK enforces unique
+names). But the *test suite* can't run in parallel: per-test temp DBs reset the
+subnet allocator to `192.168.100.0/24` every time, and fixed range names
+(`persist`/`sdkrange`/`topo*`/`nsr`) collide on netns/veth/seed/overlay paths
+(all keyed on range name). Surfaced running the suite parallel on the 96-core
+EC2 box (29/60 concurrent copies failed on `FileExistsError .../seeds/<range>`).
+
+**Changes:**
+- Unique per-run range names — prefix with a run/worker id (e.g. xdist
+  `worker_id` or a uuid) so netns (`rangectl-<name>`), veth (`mgh<hash>`), and
+  disk paths never collide across concurrent runs.
+- Host-wide subnet source of truth — either one shared StateDB for all
+  concurrent ranges, or a file-locked host registry, so independent test DBs
+  don't both grab `.100.0`.
+- Per-run seed/overlay roots for **integration** (the unit slice — SEED_ROOT/
+  OVERLAY_ROOT — is already handled by the `_isolate_state_roots` autouse
+  conftest fixture).
+- Working `pytest-xdist` (EC2's pip index maxes at xdist 1.24.1, broken under
+  pytest 9 — needs a venv/working index).
+
+**Depends on**: `20260601-3` (StateDB read-lock) should land first — parallel
+deploys hammer the shared sqlite connection harder.
+
+- **Unit tests**: already isolated; verify N concurrent suite copies stay green.
+- **Integration tests**: run Topo 1-7 + persistent + cli concurrently via xdist
+  on EC2 with no subnet/netns/disk collisions.
+
+**Priority**: low — pure test-infra speed/parallelism. Production correctness is
+unaffected. Revisit when suite wall-clock becomes a bottleneck.
 
 ## Open Questions
 - YAML export schema — define later

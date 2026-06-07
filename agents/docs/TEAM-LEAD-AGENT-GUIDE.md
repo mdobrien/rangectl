@@ -187,8 +187,7 @@ Every kickoff must have:
 3. Update TaskUpdate: mark completed
 4. Send shutdown_request to agent
 5. Update tracking file progress log with full details
-6. Stop EC2 instance if no more phases today: `scratch/scripts/ec2.sh stop`
-7. Advance to next phase
+6. Advance to next phase
 
 ## Tracking File: What to Record Per Phase
 
@@ -263,8 +262,8 @@ The coding agent starts with a fresh context. Everything it needs must be in the
 ### Sequential phases, one agent at a time
 Don't spawn Phase N+1 until Phase N is committed and verified. Phases build on each other.
 
-### EC2 costs money
-Always stop the instance when not actively running integration tests. `scratch/scripts/ec2.sh stop` after each phase. Start it again when the next phase needs Gate 2.
+### Leave EC2 running during dev cycles
+Don't stop/start EC2 between phases — the overhead (5-10 min + quota issues) kills velocity. The user will stop it when they're done for the day.
 
 ### Push back on shallow fixes — demand root causes
 When an agent reports a fix, verify it addresses the root cause, not a symptom. Shallow fixes compound: the Phase 12 destroy bug started as "cgroup rmdir fails with EBUSY" but the root cause was `destroy_range()` killing only the unshare wrapper, not libvirtd. Fixing rmdir retry logic would have masked the leaked processes, causing cascading SSH timeouts in later tests. Always ask: "why is this happening?" not "how do I make the error go away?"
@@ -285,5 +284,5 @@ When an agent goes idle or seems to be spinning (retrying the same thing, not ma
 | Cross-links missing | Always update plan + tracking when creating issues |
 | Agent reports failures as "pre-existing" | Push back — all tests must pass |
 | Agent skips tests due to missing test data | Push back — fill the gap, don't skip |
-| EC2 instance left running overnight | Stop after each phase completes |
+| EC2 instance left running overnight | User manages EC2 lifecycle, not agents |
 | Test topology left deployed on EC2 | Agent must destroy all topologies before committing |
