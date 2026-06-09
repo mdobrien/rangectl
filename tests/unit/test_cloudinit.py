@@ -31,8 +31,8 @@ def test_network_config_macaddress_is_quoted_string():
     original string, not an integer — for both sexagesimal and hex MACs."""
     for mac in (SEXAGESIMAL_MAC, HEX_MAC):
         cfg = _network_config([
-            {"mac": mac, "ip": "192.168.100.2", "cidr": "24",
-             "gateway": "192.168.100.254"},
+            {"mac": mac, "ip": "10.255.1.2", "cidr": "24",
+             "gateway": "10.255.1.254"},
         ])
         loaded = yaml.safe_load(cfg)
         match = loaded["ethernets"]["if0"]["match"]
@@ -43,13 +43,13 @@ def test_network_config_macaddress_is_quoted_string():
 def test_network_config_emits_addresses_and_gateway():
     """Sanity: the static address and default route are still present."""
     cfg = _network_config([
-        {"mac": SEXAGESIMAL_MAC, "ip": "192.168.100.2", "cidr": "24",
-         "gateway": "192.168.100.254"},
+        {"mac": SEXAGESIMAL_MAC, "ip": "10.255.1.2", "cidr": "24",
+         "gateway": "10.255.1.254"},
         {"mac": HEX_MAC, "ip": "10.0.1.2", "cidr": "24", "gateway": None},
     ])
     loaded = yaml.safe_load(cfg)
     if0 = loaded["ethernets"]["if0"]
-    assert if0["addresses"] == ["192.168.100.2/24"]
-    assert if0["routes"][0]["via"] == "192.168.100.254"
+    assert if0["addresses"] == ["10.255.1.2/24"]
+    assert if0["routes"][0]["via"] == "10.255.1.254"
     # Second iface has no gateway -> no routes block.
     assert "routes" not in loaded["ethernets"]["if1"]

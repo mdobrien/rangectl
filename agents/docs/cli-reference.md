@@ -54,8 +54,10 @@ leaks**, peak load ~4.5 on the 96-core box (deploy ~82s, destroy ~41s).
 
 - **Mgmt subnets are host-global**, allocated from a flock-guarded registry
   (`rangectl/subnet_registry.py`, default `~/.rangectl/mgmt_subnets.json`,
-  override with `RANGECTL_SUBNET_REGISTRY`). Concurrent ranges get distinct
-  `/24s` (`192.168.100.0/24` … `199.0/24`) — they never both grab `.100`.
+  override with `RANGECTL_SUBNET_REGISTRY`; pool overridable with
+  `RANGECTL_MGMT_POOL`). Concurrent ranges get distinct `/24s` from
+  `10.255.0.0/16` (`10.255.1.0/24` … `10.255.254.0/24`) — they never both grab
+  `.1`.
 - **Data subnets are isolated by netns**, so identical internal addressing
   across ranges is non-colliding. This requires **namespace mode** — now the
   default for `Topology.deploy()` (`use_namespaces=True`). Legacy host-level

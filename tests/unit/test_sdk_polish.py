@@ -130,7 +130,7 @@ def test_range_context_manager(backend, db):
 
 def _live(backend, os_type=OSType.LINUX):
     backend.vms["vm-1"] = None
-    return LiveNode(name="n", mgmt_ip="192.168.100.2", topology_name="t",
+    return LiveNode(name="n", mgmt_ip="10.255.1.2", topology_name="t",
                     backend=backend, vm_id="vm-1", os_type=os_type)
 
 

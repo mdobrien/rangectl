@@ -3,10 +3,10 @@
 
 Deploys a 2-node ns topology (internet=full so node b makes it under a generous
 SSH timeout) and EXITS WITHOUT TEARDOWN, leaving the VMs running so we can SSH
-into node b (192.168.100.2) and read its boot journal / cloud-init log.
+into node b (10.255.1.2) and read its boot journal / cloud-init log.
 
 Run on EC2:  sudo PYTHONPATH=/home/ubuntu/rangectl python3 scratch/scripts/diag-slow-boot.py
-Then:        sudo ssh -i /root/.rangectl/keys/diagslow/id_ed25519 ubuntu@192.168.100.2 \
+Then:        sudo ssh -i /root/.rangectl/keys/diagslow/id_ed25519 ubuntu@10.255.1.2 \
                  'systemd-analyze blame | head -20; cloud-init analyze blame | head'
 Cleanup:     handled manually after inspection.
 """
@@ -43,6 +43,6 @@ t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
 print(">>> deploying diagslow (NO teardown) ...", flush=True)
 rng = engine.deploy(t)
-print(">>> DEPLOY DONE. node a=192.168.100.1  node b=192.168.100.2", flush=True)
+print(">>> DEPLOY DONE. node a=10.255.1.1  node b=10.255.1.2", flush=True)
 print(">>> key: /root/.rangectl/keys/diagslow/id_ed25519", flush=True)
 print(">>> VMs left running for inspection.", flush=True)

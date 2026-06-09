@@ -7,17 +7,20 @@ from pathlib import Path
 
 import pytest
 
+from rangectl import subnet_registry
 from rangectl.libvirt_backend import LibvirtBackend
 from rangectl.state import StateDB
 
 log = logging.getLogger(__name__)
 
 # MASQUERADE source for VM-internet NAT. Ranges are allocated across the whole
-# mgmt pool (192.168.100.0/24 .. 192.168.199.0/24), not just .100, so the NAT
-# must cover the pool — 192.168.0.0/16 spans it. (Per-range internet=full also
-# installs its own MASQUERADE; this blanket rule covers ranges that just need
-# outbound for cloud-init regardless of which /24 they drew.)
-MGMT_SUBNET_CIDR = "192.168.0.0/16"
+# mgmt pool, not just the first /24, so the NAT must cover the pool aggregate.
+# Derived from the allocator (honors RANGECTL_MGMT_POOL) so there is exactly
+# ONE definition of the pool — the default is 10.255.0.0/16. (Per-range
+# internet=full also installs its own MASQUERADE; this blanket rule covers
+# ranges that just need outbound for cloud-init regardless of which /24 they
+# drew.)
+MGMT_SUBNET_CIDR = subnet_registry.pool_aggregate()
 
 # Share ONE host-global subnet registry across every integration process (the
 # per-file concurrency harness and pytest-xdist workers each import this

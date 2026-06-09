@@ -175,7 +175,7 @@ def test_container_backend_attach_interface_does_veth_wiring(cb):
         interfaces=[
             InterfaceSpec(
                 node_name="svc", interface_name="mgmt",
-                ip="192.168.100.2", cidr="24",
+                ip="10.255.1.2", cidr="24",
                 bridge="rlmgt-topo", mac="52:54:00:aa:bb:01",
             ),
             InterfaceSpec(
@@ -216,7 +216,7 @@ def test_container_backend_attach_interface_does_veth_wiring(cb):
     assert any("nsenter" in s and "name eth0" in s for s in flat), flat
     # IP assignment inside the netns
     assert any(
-        "nsenter" in s and "ip addr add 192.168.100.2/24" in s for s in flat
+        "nsenter" in s and "ip addr add 10.255.1.2/24" in s for s in flat
     ), flat
 
 
@@ -228,7 +228,7 @@ def test_container_backend_attach_interface_topology_link_uses_iface_name(cb):
         interfaces=[
             InterfaceSpec(
                 node_name="svc", interface_name="mgmt",
-                ip="192.168.100.2", cidr="24",
+                ip="10.255.1.2", cidr="24",
                 bridge="rlmgt-topo", mac="52:54:00:aa:bb:01",
             ),
             InterfaceSpec(
@@ -269,7 +269,7 @@ def test_container_backend_attach_interface_netns_mode():
         interfaces=[
             InterfaceSpec(
                 node_name="svc", interface_name="mgmt",
-                ip="192.168.100.2", cidr="24",
+                ip="10.255.1.2", cidr="24",
                 bridge="mgmt-br", mac="52:54:00:aa:bb:01",
             ),
         ],

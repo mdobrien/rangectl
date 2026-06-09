@@ -35,7 +35,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setattr(topo_mod.cgroup, "is_frozen", lambda name: False)
 
     def seed(name="lab", nodes=None, status="running",
-             pid=4242, write_json=True, subnet="192.168.100.0/24"):
+             pid=4242, write_json=True, subnet="10.255.1.0/24"):
         nodes = nodes or [
             {"name": "a", "image": "ubuntu", "os_type": "linux"},
             {"name": "b", "image": "ubuntu", "os_type": "linux"},
@@ -47,7 +47,7 @@ def state(tmp_path, monkeypatch):
                 topology_name=name, name=n["name"], image=n["image"],
                 vcpu=n.get("vcpu", 1), memory_mb=n.get("memory", 1024),
                 os_type=n["os_type"], state="running",
-                mgmt_ip=n.get("mgmt_ip", f"192.168.100.{i + 1}"),
+                mgmt_ip=n.get("mgmt_ip", f"10.255.1.{i + 1}"),
                 vm_id=f"{name}-{n['name']}",
             )
         db.close()
@@ -61,7 +61,7 @@ def state(tmp_path, monkeypatch):
                 "netns_name": f"rangectl-{name}",
                 "veth_host": "mgh0001",
                 "veth_ns": "mgp0001",
-                "host_ip": "192.168.100.254",
+                "host_ip": "10.255.1.254",
                 "subnet": subnet,
                 "libvirt_socket": str(sock),
             }))
@@ -118,18 +118,18 @@ def test_connect_missing_netns(state, monkeypatch):
 def test_connect_rebuilds_livenodes(state):
     state.seed("lab", nodes=[
         {"name": "router", "image": "vyos-1.4", "os_type": "vyos",
-         "mgmt_ip": "192.168.100.1"},
+         "mgmt_ip": "10.255.1.1"},
         {"name": "target", "image": "ubuntu-22.04", "os_type": "linux",
-         "mgmt_ip": "192.168.100.2"},
+         "mgmt_ip": "10.255.1.2"},
     ])
     rng = Range.connect("lab", db_path=state.db_file, range_dir=state.range_dir)
 
     router = rng["router"]
     assert router._vm_id == "lab-router"
-    assert router.mgmt_ip == "192.168.100.1"
+    assert router.mgmt_ip == "10.255.1.1"
     assert isinstance(router._backend, LibvirtBackend)
     # SSH state must be populated for exec() to work cross-process.
-    assert router._backend._vm_mgmt_ip["lab-router"] == "192.168.100.1"
+    assert router._backend._vm_mgmt_ip["lab-router"] == "10.255.1.1"
     assert router._backend._vm_ssh_user["lab-router"] == "vyos"
     assert rng["target"]._backend._vm_ssh_user["lab-target"] == "ubuntu"
 
@@ -182,14 +182,14 @@ def test_range_destroy_method_calls_engine():
 # ---------- list ----------
 
 def test_list_running(state):
-    state.seed("one", subnet="192.168.100.0/24")
-    state.seed("two", subnet="192.168.101.0/24")
+    state.seed("one", subnet="10.255.1.0/24")
+    state.seed("two", subnet="10.255.2.0/24")
     rows = Range.list(db_path=state.db_file, range_dir=state.range_dir)
     by_name = {r["name"]: r for r in rows}
     assert set(by_name) == {"one", "two"}
     assert by_name["one"]["status"] == "running"
     assert by_name["one"]["node_count"] == 2
-    assert by_name["one"]["mgmt_subnet"] == "192.168.100.0/24"
+    assert by_name["one"]["mgmt_subnet"] == "10.255.1.0/24"
 
 
 def test_list_excludes_destroyed(state):

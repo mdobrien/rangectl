@@ -15,7 +15,7 @@ from rangectl.types import ExecResult, RangeNotRunning
 # --- fakes -----------------------------------------------------------------
 
 class FakeNode:
-    def __init__(self, name, mgmt_ip="192.168.100.2", ssh_user="ubuntu",
+    def __init__(self, name, mgmt_ip="10.255.1.2", ssh_user="ubuntu",
                  status="running", exec_result=None):
         self.name = name
         self.mgmt_ip = mgmt_ip
@@ -131,13 +131,13 @@ def test_list_empty(monkeypatch, capsys):
 def test_list_formats_table(monkeypatch, capsys):
     monkeypatch.setattr(cli.Range, "list", staticmethod(lambda: [
         {"name": "lab", "status": "running", "node_count": 2,
-         "mgmt_subnet": "192.168.100.0/24", "created_at": "2026-06-01"},
+         "mgmt_subnet": "10.255.1.0/24", "created_at": "2026-06-01"},
     ]))
     assert _run(["list"]) == 0
     out = capsys.readouterr().out
     assert "lab" in out
     assert "running" in out
-    assert "192.168.100.0/24" in out
+    assert "10.255.1.0/24" in out
     assert "2" in out
 
 
@@ -213,14 +213,14 @@ def test_upload(monkeypatch, capsys):
 
 def test_ssh_config_output(monkeypatch, capsys):
     rng = FakeRange("lab", [
-        FakeNode("router", mgmt_ip="192.168.100.1"),
-        FakeNode("target", mgmt_ip="192.168.100.2"),
+        FakeNode("router", mgmt_ip="10.255.1.1"),
+        FakeNode("target", mgmt_ip="10.255.1.2"),
     ])
     monkeypatch.setattr(cli.Range, "connect", staticmethod(lambda n: rng))
     assert _run(["ssh-config", "lab"]) == 0
     out = capsys.readouterr().out
     assert "Host lab-router" in out
-    assert "HostName 192.168.100.1" in out
+    assert "HostName 10.255.1.1" in out
     assert "User ubuntu" in out
     assert "id_ed25519" in out
     assert "lab/id_ed25519" in out

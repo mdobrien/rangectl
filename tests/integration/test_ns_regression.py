@@ -46,7 +46,7 @@ def _without_blanket_nat():
     """Temporarily drop conftest's session-wide MASQUERADE for the default mgmt
     subnet.
 
-    Every fresh-DB test allocates the first subnet (192.168.100.0/24), which
+    Every fresh-DB test allocates the first subnet (10.255.1.0/24), which
     the ``vm_internet_nat`` session fixture NATs unconditionally for legacy
     tests. That blanket rule would mask the per-range internet policy, so the
     internet tests remove it for their duration and restore it afterward —

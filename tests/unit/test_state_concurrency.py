@@ -20,7 +20,7 @@ def test_concurrent_reads_and_writes_no_interface_error(tmp_path):
     must not raise sqlite3.InterfaceError on the shared connection."""
     db = StateDB(db_path=str(tmp_path / "state.db"))
     try:
-        db.save_topology("t", "deploying", "192.168.100.0/24", "mgmt-br")
+        db.save_topology("t", "deploying", "10.255.1.0/24", "mgmt-br")
         db.add_image("ubuntu", "/img/ubuntu.qcow2")
 
         errors: list[BaseException] = []
@@ -81,7 +81,7 @@ def test_concurrent_writers_no_transaction_error(tmp_path):
                 for i in range(60):
                     topo = f"t{idx}-{i}"
                     db.save_topology(topo, "deploying",
-                                     "192.168.100.0/24", "mgmt-br")
+                                     "10.255.1.0/24", "mgmt-br")
                     db.add_image(f"img{idx}-{i}", "/img/x.qcow2")
                     db.remove_image(f"img{idx}-{i}")
                     db.delete_topology(topo)

@@ -165,8 +165,8 @@ def test_deploy_assigns_mgmt_ips(backend, db):
     ip_b = rng["b"].mgmt_ip
     assert ip_a and ip_b
     assert ip_a != ip_b
-    assert ip_a.startswith("192.168.")
-    assert ip_b.startswith("192.168.")
+    assert ip_a.startswith("10.255.")
+    assert ip_b.startswith("10.255.")
 
 
 def test_destroy_cleans_up(backend, db):

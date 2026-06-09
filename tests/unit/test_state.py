@@ -5,16 +5,16 @@ import pytest
 
 def test_allocate_mgmt_subnet_first(db):
     subnet = db.allocate_mgmt_subnet("topo-a")
-    assert subnet == "192.168.100.0/24"
+    assert subnet == "10.255.1.0/24"
 
 
 def test_allocate_mgmt_subnet_sequential(db):
     a = db.allocate_mgmt_subnet("topo-a")
     b = db.allocate_mgmt_subnet("topo-b")
     c = db.allocate_mgmt_subnet("topo-c")
-    assert a == "192.168.100.0/24"
-    assert b == "192.168.101.0/24"
-    assert c == "192.168.102.0/24"
+    assert a == "10.255.1.0/24"
+    assert b == "10.255.2.0/24"
+    assert c == "10.255.3.0/24"
 
 
 def test_free_mgmt_subnet_releases_for_reuse(db):
@@ -26,12 +26,12 @@ def test_free_mgmt_subnet_releases_for_reuse(db):
 
 
 def test_save_and_get_topology(db):
-    db.save_topology("t1", "active", "192.168.100.0/24", "rlmgt-deadbe")
+    db.save_topology("t1", "active", "10.255.1.0/24", "rlmgt-deadbe")
     row = db.get_topology("t1")
     assert row is not None
     assert row["name"] == "t1"
     assert row["status"] == "active"
-    assert row["mgmt_subnet"] == "192.168.100.0/24"
+    assert row["mgmt_subnet"] == "10.255.1.0/24"
     assert row["mgmt_bridge"] == "rlmgt-deadbe"
 
 
@@ -40,23 +40,23 @@ def test_get_topology_missing(db):
 
 
 def test_list_topologies(db):
-    db.save_topology("t1", "active", "192.168.100.0/24", "br1")
-    db.save_topology("t2", "active", "192.168.101.0/24", "br2")
+    db.save_topology("t1", "active", "10.255.1.0/24", "br1")
+    db.save_topology("t2", "active", "10.255.2.0/24", "br2")
     names = sorted(t["name"] for t in db.list_topologies())
     assert names == ["t1", "t2"]
 
 
 def test_delete_topology(db):
-    db.save_topology("t1", "active", "192.168.100.0/24", "br1")
+    db.save_topology("t1", "active", "10.255.1.0/24", "br1")
     db.delete_topology("t1")
     assert db.get_topology("t1") is None
     assert db.list_topologies() == []
 
 
 def test_save_and_update_node(db):
-    db.save_topology("t1", "active", "192.168.100.0/24", "br1")
+    db.save_topology("t1", "active", "10.255.1.0/24", "br1")
     db.save_node("t1", "n1", image="ubuntu", vcpu=2, memory_mb=2048,
-                 os_type="linux", state="defined", mgmt_ip="192.168.100.1")
+                 os_type="linux", state="defined", mgmt_ip="10.255.1.1")
     db.update_node_state("t1", "n1", "ready")
     cur = db._conn.execute(
         "SELECT state, mgmt_ip FROM nodes WHERE topology_name=? AND name=?",
@@ -64,7 +64,7 @@ def test_save_and_update_node(db):
     )
     state, mgmt_ip = cur.fetchone()
     assert state == "ready"
-    assert mgmt_ip == "192.168.100.1"
+    assert mgmt_ip == "10.255.1.1"
 
 
 def test_log_event_and_get_logs(db):

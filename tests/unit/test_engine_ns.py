@@ -33,7 +33,7 @@ def ns(monkeypatch):
         pid=4242,
         netns_name="rangectl-r",
         libvirt_socket="/ranges/r/run-libvirt/libvirt-sock",
-        mgmt_subnet="192.168.100.0/24",
+        mgmt_subnet="10.255.1.0/24",
         veth_host="mgh1234",
         veth_ns="mgp1234",
     )
@@ -98,7 +98,7 @@ def test_deploy_calls_create_range(backend, db, ns):
     topo = _two_node_link_topo()
     engine.deploy(topo)
     # No resources → no cgroup path passed to create_range.
-    assert ns.created == [("nsr", "192.168.100.0/24", None)]
+    assert ns.created == [("nsr", "10.255.1.0/24", None)]
 
 
 def test_deploy_uses_per_range_backend_for_vms(backend, db, ns):
@@ -124,7 +124,7 @@ def test_make_range_backend_gets_socket_and_netns(backend, db, monkeypatch):
     info = RangeInfo(
         name="r", pid=1, netns_name="rangectl-r",
         libvirt_socket="/ranges/r/run-libvirt/libvirt-sock",
-        mgmt_subnet="192.168.100.0/24", veth_host="h", veth_ns="p",
+        mgmt_subnet="10.255.1.0/24", veth_host="h", veth_ns="p",
     )
     engine = Engine(backend, db, use_namespaces=True)
     engine._make_range_backend(info)
@@ -204,7 +204,7 @@ def test_deploy_cleanup_on_fail_tears_down_range(backend, db, ns, monkeypatch):
 
     def boom(vm_id):
         ns.range_backend._record("start", vm_id)
-        raise RuntimeError("SSH not reachable on 192.168.100.2 after 240s: timed out")
+        raise RuntimeError("SSH not reachable on 10.255.1.2 after 240s: timed out")
     monkeypatch.setattr(ns.range_backend, "start", boom)
 
     with pytest.raises(RuntimeError, match="timed out"):
@@ -246,7 +246,7 @@ def test_deploy_with_resources_creates_cgroup_and_writes_pid(backend, db, ns):
     assert ("write_pid", f"/sys/fs/cgroup/rangectl-{topo.name}", 4242) in ns.cgroup_calls
     # The cgroup path must reach create_range so libvirtd self-places into it —
     # this is what actually puts QEMU under the freezer/limits.
-    assert ns.created == [("nsr", "192.168.100.0/24",
+    assert ns.created == [("nsr", "10.255.1.0/24",
                           f"/sys/fs/cgroup/rangectl-{topo.name}")]
     engine.destroy(topo)
     assert ("destroy", topo.name) in ns.cgroup_calls
@@ -264,7 +264,7 @@ def test_deploy_full_internet_enables_during_setup(backend, db, ns):
     engine = Engine(backend, db, use_namespaces=True, internet="full")
     topo = _two_node_link_topo()
     engine.deploy(topo)
-    assert ("enable", "nsr", "192.168.100.0/24", "mgh1234") in ns.internet_calls
+    assert ("enable", "nsr", "10.255.1.0/24", "mgh1234") in ns.internet_calls
 
 
 def test_deploy_none_internet_does_not_enable(backend, db, ns):
@@ -278,7 +278,7 @@ def test_destroy_full_internet_disables(backend, db, ns):
     topo = _two_node_link_topo()
     engine.deploy(topo)
     engine.destroy(topo)
-    assert ("disable", "nsr", "192.168.100.0/24", "mgh1234") in ns.internet_calls
+    assert ("disable", "nsr", "10.255.1.0/24", "mgh1234") in ns.internet_calls
 
 
 def test_deploy_full_internet_wires_range_controls(backend, db, ns):
@@ -287,7 +287,7 @@ def test_deploy_full_internet_wires_range_controls(backend, db, ns):
     rng = engine.deploy(_two_node_link_topo())
     assert rng.internet == "full"
     assert rng._veth_host == "mgh1234"
-    assert rng._mgmt_subnet == "192.168.100.0/24"
+    assert rng._mgmt_subnet == "10.255.1.0/24"
 
 
 # --- backward compat -------------------------------------------------------
