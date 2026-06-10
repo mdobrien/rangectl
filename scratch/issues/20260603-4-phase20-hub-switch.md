@@ -1,6 +1,6 @@
 # Phase 20: Hub & Switch Node Types
 **Created**: 2026-06-03
-**Status**: In Progress (Gate 1 green; Gate 2 pending EC2)
+**Status**: Complete (Gate 1 + Gate 2 green; awaiting team-lead merge to main)
 **Depends on**: Phase 19 (Link Properties)
 
 ## Related Issues
@@ -77,13 +77,13 @@ rangectl net <range>             # shows switch/hub bridges in topology view
 - [x] `Range.hub(name, ports)` creates a flood-all bridge
 - [x] Switch/hub created instantly (no boot, no health check)
 - [x] `switch.portN` / `hub.portN` work in `link()` calls
-- [ ] VMs can communicate through switch (Gate 2)
-- [ ] Hub floods all traffic to all ports (Gate 2)
-- [ ] Switch only forwards learned unicast (Gate 2)
+- [x] VMs can communicate through switch (Gate 2 ✓)
+- [x] Hub floods all traffic to all ports (Gate 2 ✓)
+- [x] Switch only forwards learned unicast (Gate 2 ✓)
 - [x] Switch/Hub show in `rangectl status` and `rangectl net`
-- [x] Link properties (Phase 19) work on switch/hub ports (unit; Gate 2 pending)
+- [x] Link properties (Phase 19) work on switch/hub ports (unit + Gate 2 ✓)
 - [x] Unit tests: bridge creation, MAC learning flag, port assignment
-- [x] Integration tests WRITTEN (`tests/integration/test_hub_switch.py`); not yet run (EC2 owned by phase16c)
+- [x] Integration tests: switch forwarding, hub flooding, IDS visibility (Gate 2 ✓)
 
 ## Progress Log
 - 2026-06-09 (phase20-coder, branch `phase20-hub-switch`): Implemented full design
@@ -118,3 +118,26 @@ rangectl net <range>             # shows switch/hub bridges in topology view
     time and behave like a switch in the IDS test. Verify on EC2.
   - Gate 2 tests written (5 tests: switch mesh+isolation+impair+CLI, hub
     floods to IDS, switch↔hub uplink + veth impair, loop abort). NOT run.
+- 2026-06-09 (later): Rebased onto main `9cfd665` (Phase 16c) — clean, no
+  conflicts; labs that apt-install tcpdump opted into `internet="full"` (16c
+  retired the blanket test NAT). Unit suite post-rebase: 425/425.
+- 2026-06-09 **Gate 2 on EC2** (44.210.81.28, 96-core, iproute2 5.15):
+  - Run 1: 2/4 — hub didn't flood (IDS saw 0 pkts) + `rangectl status` exit 2.
+    Root-caused in `20260609-13-gate2-hub-flood-fdb-flush.md`: `bridge fdb
+    flush` needs iproute2 ≥ 6.1 (silently failed → boot-learned FDB entries
+    made the hub switch-like); CLI subprocess reads the default StateDB, not
+    the tmp fixture DB. Fixed: per-entry `bridge fdb del` (skip permanent;
+    +3 unit tests, suite 428/428); switch test deploys vs default DB.
+  - Run 2: **`tests/integration/test_hub_switch.py` 4/4 in 199s** — switch
+    mesh ping ✓, switch does NOT leak learned unicast to IDS ✓, VM↔switch
+    impair (RTT +100ms) + outbound-toward-L2 raises ✓, CLI status ✓, hub
+    floods a↔b unicast to IDS ✓, switch↔hub veth uplink carries traffic +
+    L2↔L2 impair ✓, loop abort with named nodes ✓.
+  - Phase 19 regression `test_link_properties.py` (D6 endpoint generalization
+    touched it): **2/2 in 142s**.
+  - Teardown verified: 0 qemu, 0 range libvirtd, only `rangectl-mgmt` netns,
+    `rangectl list` empty, subnet registry `{}`. EC2 left running.
+
+## Resolution
+Phase 20 complete: Gate 1 428/428 unit (zero skips), Gate 2 4/4 + Phase 19
+regression 2/2 on EC2. Branch `phase20-hub-switch`; team-lead merges to main.
