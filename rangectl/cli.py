@@ -76,10 +76,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     nodes = rng._db.list_nodes(rng.name)
     detail = []
     for n in nodes:
-        try:
-            live_status = rng[n["name"]].status
-        except Exception:
+        if n["os_type"] in ("switch", "hub"):
+            # L2 devices have no VM — render their DB state, never query
+            # power/SSH (Phase 20, D8).
             live_status = n.get("state", "?")
+        else:
+            try:
+                live_status = rng[n["name"]].status
+            except Exception:
+                live_status = n.get("state", "?")
         detail.append({
             "name": n["name"],
             "status": live_status,
@@ -95,8 +100,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                         default_flow_style=False, sort_keys=False), end="")
         return 0
     print(f"Range: {rng.name}")
-    rows = [[d["name"], d["status"], d["ip"] or "-", d["image"], d["os"],
-             d["vcpu"], d["memory_mb"]] for d in detail]
+    rows = [[d["name"], d["status"], d["ip"] or "-", d["image"] or "-",
+             d["os"], d["vcpu"], d["memory_mb"]] for d in detail]
     _print_table(["NODE", "STATUS", "IP", "IMAGE", "OS", "VCPU", "MEM(MB)"],
                  rows)
     return 0
@@ -230,8 +235,30 @@ def cmd_net(args: argparse.Namespace) -> int:
     for n in rng._db.list_nodes(rng.name):
         print(f"    {n['name']:<12} {n.get('mgmt_ip') or '-':<16} "
               f"({n['os_type']})")
-    # Bridges live inside the namespace — best-effort, may need root.
+    # L2 devices (switches/hubs) with their enslaved ports. Port listing is
+    # best-effort (`bridge link show` inside the netns, may need root).
+    l2_bridges = [b for b in rng._db.list_bridges(rng.name)
+                  if b["bridge_type"] in ("switch", "hub")]
     import subprocess
+    if l2_bridges:
+        ports_by_bridge: dict[str, list[str]] = {}
+        res = subprocess.run(
+            ["ip", "netns", "exec", netns, "bridge", "link", "show"],
+            capture_output=True, text=True)
+        if res.returncode == 0:
+            for line in res.stdout.strip().splitlines():
+                # "N: dev@ifN: <flags> mtu 1500 master br0 ..." — take the
+                # port name and the bridge after "master".
+                fields = line.split()
+                if len(fields) < 2 or "master" not in fields:
+                    continue
+                dev = fields[1].rstrip(":").split("@", 1)[0]
+                master = fields[fields.index("master") + 1]
+                ports_by_bridge.setdefault(master, []).append(dev)
+        print("  l2 devices:")
+        for b in l2_bridges:
+            ports = ", ".join(ports_by_bridge.get(b["name"], [])) or "-"
+            print(f"    {b['name']:<12} ({b['bridge_type']})  ports: {ports}")
     res = subprocess.run(
         ["ip", "netns", "exec", netns, "ip", "-o", "link", "show",
          "type", "bridge"],

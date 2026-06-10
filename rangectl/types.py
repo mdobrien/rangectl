@@ -73,6 +73,10 @@ class OSType(Enum):
     WINDOWS = "windows"
     VYOS = "vyos"
     CONTAINER = "container"
+    # L2 device types (Phase 20) — boot-free nodes whose "body" is a Linux
+    # bridge inside the range netns. Stored in the nodes table os_type column.
+    SWITCH = "switch"
+    HUB = "hub"
 
     @classmethod
     def register(cls, name: str, driver_cls) -> None:

@@ -19,7 +19,7 @@ from rangectl.networking import (
     ns_mgmt_bridge_name,
 )
 from rangectl.state import StateDB
-from rangectl.topology import LiveNode, Node, Range, Topology
+from rangectl.topology import LinkEndpoint, LiveNode, Node, Range, Topology
 from rangectl.types import (
     CycleError,
     InterfaceSpec,
@@ -73,6 +73,16 @@ def _mac_for(topo_name: str, node_name: str, suffix: str) -> str:
     """Deterministic locally-administered MAC derived from names."""
     h = hashlib.sha1(f"{topo_name}/{node_name}/{suffix}".encode()).hexdigest()
     return "52:54:00:" + ":".join(h[i:i + 2] for i in (0, 2, 4))
+
+
+def _l2_veth_names(topo_name: str, link_index: int) -> tuple[str, str]:
+    """Kernel-legal, deterministic veth names for an L2<->L2 link's uplink.
+
+    Engine-chosen and static (unlike libvirt TAPs), so impairment and
+    reconnect can address them without any runtime discovery.
+    """
+    h = hashlib.sha1(f"{topo_name}/l2link/{link_index}".encode()).hexdigest()[:8]
+    return f"l2a{h}", f"l2b{h}"
 
 
 def _guest_iface_name(image_os_type: str, slot_index: int) -> str:
@@ -218,6 +228,92 @@ class Engine:
             placed.update(n.name for n in wave)
         return waves
 
+    def _check_l2_cycles(self, topology: Topology) -> None:
+        """Abort if links between L2 nodes form a loop (D7).
+
+        Linux bridges run without STP, so a switch/hub cycle floods broadcast
+        frames forever — a broadcast storm. Union-find over the L2 subgraph:
+        an L2<->L2 link joining two already-connected nodes closes a loop
+        (parallel links and self-links included). VM links never count — a
+        guest does not bridge its own NICs.
+        """
+        parent: dict[str, str] = {}
+
+        def find(x: str) -> str:
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for link in topology._links:
+            a, b = link.if_a.node_name, link.if_b.node_name
+            if not (topology._nodes[a].is_l2 and topology._nodes[b].is_l2):
+                continue
+            root_a, root_b = find(a), find(b)
+            if root_a == root_b:
+                looped = sorted(n for n in parent if find(n) == root_a)
+                raise CycleError(
+                    f"L2 loop detected among switch/hub nodes {looped}: "
+                    "Linux bridges run without STP, so a loop causes a "
+                    "broadcast storm. Remove a link to break the cycle."
+                )
+            parent[root_b] = root_a
+
+    def _bridge_for_link(self, topology: Topology, link_index: int) -> str | None:
+        """The bridge a link's endpoints attach to. A VM<->L2 link uses the L2
+        node's own bridge (the switch IS the segment — no data-<i> bridge);
+        an L2<->L2 link has no single bridge (veth pair, returns None)."""
+        link = topology._links[link_index]
+        node_a = topology._nodes[link.if_a.node_name]
+        node_b = topology._nodes[link.if_b.node_name]
+        if node_a.is_l2 and node_b.is_l2:
+            return None
+        if node_a.is_l2:
+            return node_a.bridge_name
+        if node_b.is_l2:
+            return node_b.bridge_name
+        return self._link_bridge_name(topology.name, link_index)
+
+    def _provision_l2_node(self, topology: Topology, node: Node) -> None:
+        """Create an L2 node's bridge and sprint it through the state machine.
+
+        Runs during infra setup, before any VM boots — the bridge existing IS
+        the node being up, so PROVISIONING -> READY -> LINKED -> RUNNING all
+        happen here. No mgmt interface, no SSH, no health check (D5/D8).
+        """
+        log.info("[%s/%s] Provisioning (l2 %s)", topology.name, node.name,
+                 node.os_type.value)
+        node.state = transition_node_state(node.state, NodeState.PROVISIONING)
+        self._db.save_node(
+            topology_name=topology.name,
+            name=node.name,
+            image="",
+            vcpu=0,
+            memory_mb=0,
+            os_type=node.os_type.value,
+            state=node.state.value,
+        )
+        self._db.log_event(topology.name, node.name, "info",
+                           f"provisioning ({node.os_type.value})")
+
+        bridge = node.bridge_name
+        self._vm_backend(topology.name).create_bridge(bridge)
+        self._db._conn.execute(
+            "INSERT INTO bridges (topology_name, name, bridge_type) VALUES (?, ?, ?)",
+            (topology.name, bridge, node.os_type.value),
+        )
+        self._db._conn.commit()
+        # Track for legacy-mode teardown (in ns mode the bridge dies with the
+        # netns, where deletion is a harmless no-op).
+        self._link_bridges[topology.name].append(bridge)
+
+        for target in (NodeState.READY, NodeState.LINKED, NodeState.RUNNING):
+            node.state = transition_node_state(node.state, target)
+        self._db.update_node_state(topology.name, node.name, node.state.value)
+        self._db.log_event(topology.name, node.name, "info",
+                           f"running (bridge {bridge})")
+
     def _link_index_for(self, topology: Topology, node_name: str,
                         iface_name: str) -> int | None:
         for i, link in enumerate(topology._links):
@@ -297,6 +393,9 @@ class Engine:
 
         log.info("Step 1: Validate resources")
         self.validate_resources(topology)
+        # Fail fast, before anything is allocated: an L2 loop would melt the
+        # range's network (no STP on Linux bridges).
+        self._check_l2_cycles(topology)
 
         log.info("Step 2: Allocate mgmt subnet")
         mgmt_subnet = self._db.allocate_mgmt_subnet(topology.name)
@@ -328,8 +427,19 @@ class Engine:
         self._db.log_event(topology.name, None, "info",
                            f"mgmt subnet {mgmt_subnet} bridge {mgmt_bridge}")
 
-        log.info("Step 4: Create topology link bridges")
-        for i, _ in enumerate(topology._links):
+        log.info("Step 4: Create topology bridges (L2 devices + link bridges)")
+        # L2 nodes (switches/hubs) first — VM domain XML references their
+        # bridges, so they must exist before any VM boots. They also complete
+        # their whole lifecycle here (boot-free, D5).
+        for node in topology._nodes.values():
+            if node.is_l2:
+                self._provision_l2_node(topology, node)
+        # Per-link data bridges only where both endpoints are VMs/containers;
+        # a link touching an L2 node uses that node's bridge instead (D4).
+        for i, link in enumerate(topology._links):
+            if (topology._nodes[link.if_a.node_name].is_l2
+                    or topology._nodes[link.if_b.node_name].is_l2):
+                continue
             br = self._link_bridge_name(topology.name, i)
             vm_backend.create_bridge(br)
             self._link_bridges[topology.name].append(br)
@@ -344,6 +454,8 @@ class Engine:
             name: i for i, name in enumerate(topology._nodes.keys())
         }
         for node in topology._nodes.values():
+            if node.is_l2:
+                continue  # no mgmt interface on L2 devices (D8)
             ip = allocate_mgmt_ip(mgmt_subnet, node_index[node.name])
             self._mgmt_ips[(topology.name, node.name)] = ip
 
@@ -361,8 +473,9 @@ class Engine:
         # boot every node in one capped-parallel batch rather than wave-by-wave;
         # the DAG is reserved for dependency injection (Step 9), where it matters.
         log.info("Step 7: Boot all nodes (parallel)")
-        all_nodes = list(topology._nodes.values())
-        self._deploy_wave(topology, all_nodes, mgmt_subnet, mgmt_bridge,
+        # L2 nodes already completed their lifecycle in Step 4 — nothing boots.
+        boot_nodes = [n for n in topology._nodes.values() if not n.is_l2]
+        self._deploy_wave(topology, boot_nodes, mgmt_subnet, mgmt_bridge,
                           ssh_pubkey, host_ip)
 
         log.info("Step 8: Wire topology links (DB + attach for hot-attach back-ends)")
@@ -388,6 +501,8 @@ class Engine:
 
         rng = Range(topology, internet=self._internet, resources=self._resources)
         for node in topology._nodes.values():
+            if node.is_l2:
+                continue  # no LiveNode — nothing to exec/SSH/power (D8)
             mgmt_ip = self._mgmt_ips[(topology.name, node.name)]
             is_vyos = node.os_type == OSType.VYOS
             os_type = "container" if node.is_container else node.os_type
@@ -501,7 +616,8 @@ class Engine:
             link_idx = self._link_index_for(topology, node.name, iface_name)
             if link_idx is None:
                 continue
-            br = self._link_bridge_name(topology.name, link_idx)
+            # A link to an L2 device wires straight onto that device's bridge.
+            br = self._bridge_for_link(topology, link_idx)
             mac = _mac_for(topology.name, node.name, iface_name)
             ifaces.append(InterfaceSpec(
                 node_name=node.name,
@@ -691,11 +807,12 @@ class Engine:
                            f"ready (container), mgmt_ip={mgmt_ip}")
 
     def _wire_link(self, topology: Topology, link, link_index: int) -> None:
-        br = self._link_bridge_name(topology.name, link_index)
+        br = self._bridge_for_link(topology, link_index)
         log.info("[%s] Wiring link %d: %s/%s <-> %s/%s via %s",
                  topology.name, link_index,
                  link.if_a.node_name, link.if_a.interface_name,
-                 link.if_b.node_name, link.if_b.interface_name, br)
+                 link.if_b.node_name, link.if_b.interface_name,
+                 br or "veth pair")
 
         self._db._conn.execute(
             "INSERT INTO links (topology_name, node_a, iface_a, ip_a, "
@@ -708,22 +825,61 @@ class Engine:
         # Wire Link with backend/bridge refs so Link.down()/up() can work later.
         # In namespace mode this is the per-range backend so bridge recreate
         # happens inside the range's netns.
-        link._backend = self._vm_backend(topology.name)
+        vm_backend = self._vm_backend(topology.name)
+        link._backend = vm_backend
         link._bridge_name = br
         link._db = self._db
         link._topology_name = topology.name
 
-        # Call attach_interface for each side. LibvirtBackend uses this to
-        # ensure the VM's TAP is enslaved to the bridge (idempotent during
-        # initial deploy; load-bearing when Link.up() recreates the bridge).
-        # ContainerBackend uses this to create+wire the veth pair.
-        # Mock back-ends record the call, which the unit tests rely on.
-        for side in (link.if_a, link.if_b):
-            vm_id = self._vm_ids[(topology.name, side.node_name)]
-            mac = _mac_for(topology.name, side.node_name, side.interface_name)
-            link._endpoints.append((vm_id, mac))
-            side_node = topology._nodes[side.node_name]
-            self._backend_for(topology.name, side_node).attach_interface(vm_id, br, mac)
+        node_a = topology._nodes[link.if_a.node_name]
+        node_b = topology._nodes[link.if_b.node_name]
+
+        if node_a.is_l2 and node_b.is_l2:
+            # Two bridges joined by a veth pair (a bridge cannot enslave a
+            # bridge). Hub-side ends are hub ports like any other (D4).
+            veth_a, veth_b = _l2_veth_names(topology.name, link_index)
+            vm_backend.create_veth_pair(veth_a, veth_b,
+                                        node_a.bridge_name, node_b.bridge_name)
+            link._veth_pair = (veth_a, veth_b)
+            for side_node, dev in ((node_a, veth_a), (node_b, veth_b)):
+                ep = LinkEndpoint(node_name=side_node.name, is_l2=True,
+                                  hub=side_node.os_type is OSType.HUB,
+                                  bridge=side_node.bridge_name, dev=dev)
+                if ep.hub:
+                    vm_backend.set_port_flags(dev, learning=False, flood=True)
+                link._endpoints.append(ep)
+        else:
+            # VM<->VM (dedicated data bridge) or VM<->L2 (the L2 node's own
+            # bridge). Attach each VM/container side; the L2 side has no
+            # device of its own — the bridge IS the node.
+            for side in (link.if_a, link.if_b):
+                side_node = topology._nodes[side.node_name]
+                other = node_b if side_node is node_a else node_a
+                if side_node.is_l2:
+                    link._endpoints.append(LinkEndpoint(
+                        node_name=side_node.name, is_l2=True, bridge=br))
+                    continue
+                vm_id = self._vm_ids[(topology.name, side.node_name)]
+                mac = _mac_for(topology.name, side.node_name,
+                               side.interface_name)
+                ep = LinkEndpoint(node_name=side_node.name,
+                                  hub=other.os_type is OSType.HUB,
+                                  bridge=br, vm_id=vm_id, mac=mac)
+                link._endpoints.append(ep)
+                # LibvirtBackend uses this to ensure the VM's TAP is enslaved
+                # to the bridge (idempotent during initial deploy; load-bearing
+                # when Link.up() recreates the bridge). ContainerBackend uses
+                # this to create+wire the veth pair. Mock back-ends record the
+                # call, which the unit tests rely on.
+                self._backend_for(topology.name, side_node).attach_interface(
+                    vm_id, br, mac)
+                if ep.hub:
+                    # The VM's TAP is a port on a hub: suppress learning and
+                    # flood everything out of it, at every attach (D2).
+                    dev = ep.resolve(vm_backend)
+                    if dev:
+                        vm_backend.set_port_flags(dev, learning=False,
+                                                  flood=True)
 
         for side in (link.if_a, link.if_b):
             node = topology._nodes[side.node_name]
@@ -732,6 +888,8 @@ class Engine:
                 self._db.update_node_state(topology.name, node.name, node.state.value)
 
     def _inject_dependencies(self, topology: Topology, node: Node) -> None:
+        if node.is_l2:
+            return  # no software/services on an L2 device; already RUNNING
         log.info("[%s/%s] Injecting dependencies", topology.name, node.name)
         # Nodes without links never reach LINKED via _wire_link — bridge that gap.
         if node.state == NodeState.READY:

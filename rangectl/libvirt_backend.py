@@ -524,6 +524,42 @@ class LibvirtBackend:
         _run(self._ip("ip", "link", "set", tap, "master", bridge), check=False)
         _run(self._ip("ip", "link", "set", tap, "up"), check=False)
 
+    def create_veth_pair(self, name_a: str, name_b: str,
+                         bridge_a: str, bridge_b: str) -> None:
+        """Create a veth pair and enslave each end to its bridge (L2<->L2
+        uplinks, Phase 20). Idempotent: an existing pair is left alone."""
+        log.info("create_veth_pair: %s<->%s bridges %s<->%s (netns=%s)",
+                 name_a, name_b, bridge_a, bridge_b, self._netns_name)
+        res = _run(self._ip("ip", "link", "add", name_a, "type", "veth",
+                            "peer", "name", name_b), check=False)
+        if res.returncode != 0 and "exists" not in (res.stderr or ""):
+            raise RuntimeError(f"ip link add veth failed: {res.stderr}")
+        for dev, bridge in ((name_a, bridge_a), (name_b, bridge_b)):
+            _run(self._ip("ip", "link", "set", dev, "master", bridge))
+            _run(self._ip("ip", "link", "set", dev, "up"))
+
+    def delete_device(self, name: str) -> None:
+        """Delete a network device (deleting one veth end removes the pair)."""
+        log.info("delete_device: %s (netns=%s)", name, self._netns_name)
+        _run(self._ip("ip", "link", "delete", name), check=False)
+
+    def set_port_flags(self, port: str, *, learning: bool,
+                       flood: bool) -> None:
+        """Set bridge-port forwarding behavior. ``learning=False flood=True``
+        makes the port a hub port: the FDB never learns from it, and unknown
+        unicast floods out of it."""
+        log.info("set_port_flags: %s learning=%s flood=%s (netns=%s)",
+                 port, learning, flood, self._netns_name)
+        _run(self._ip("bridge", "link", "set", "dev", port,
+                      "learning", "on" if learning else "off",
+                      "flood", "on" if flood else "off"))
+        if not learning:
+            # Drop anything learned before the flag landed (e.g. during VM
+            # boot, when libvirt enslaves the TAP ahead of link wiring) —
+            # stale FDB entries would make a hub behave like a switch for up
+            # to the ageing time. Best-effort: older iproute2 lacks flush.
+            _run(self._ip("bridge", "fdb", "flush", "dev", port), check=False)
+
     def run_tc(self, cmds: list[list[str]]) -> None:
         """Run pre-built tc commands (each a full argv, netns-prefixed by the
         caller). Tolerant of failures — clearing a clean link or replacing an

@@ -5,7 +5,7 @@ import argparse
 import pytest
 
 from rangectl.link_properties import build_clear_cmds, build_netem_cmds
-from rangectl.topology import Link
+from rangectl.topology import Link, LinkEndpoint
 from rangectl.types import InterfaceSpec
 
 
@@ -87,7 +87,12 @@ def _make_link(backend):
     link = Link(a, b, topology=None)
     link._backend = backend
     link._bridge_name = "data-0"
-    link._endpoints = [("vm-a", "52:54:00:aa:aa:aa"), ("vm-b", "52:54:00:bb:bb:bb")]
+    link._endpoints = [
+        LinkEndpoint(node_name="a", bridge="data-0",
+                     vm_id="vm-a", mac="52:54:00:aa:aa:aa"),
+        LinkEndpoint(node_name="b", bridge="data-0",
+                     vm_id="vm-b", mac="52:54:00:bb:bb:bb"),
+    ]
     return link
 
 

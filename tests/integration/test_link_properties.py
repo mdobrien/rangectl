@@ -102,8 +102,8 @@ def test_link_impairment_via_ping(backend, db):
         # Asymmetric: impair only one endpoint's TAP. Verified at the qdisc
         # level — exactly one TAP carries netem.
         netns = link._backend._netns_name
-        tap_a = link._backend._find_tap_for_mac(*link._endpoints[0])
-        tap_b = link._backend._find_tap_for_mac(*link._endpoints[1])
+        tap_a = link._endpoints[0].resolve(link._backend)
+        tap_b = link._endpoints[1].resolve(link._backend)
         link.impair(latency="200ms", outbound="a")
         assert _tap_has_netem(netns, tap_a), "a's TAP should have netem"
         assert not _tap_has_netem(netns, tap_b), "b's TAP should be clean"

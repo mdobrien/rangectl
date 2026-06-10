@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -111,6 +112,23 @@ class Topology:
         self._nodes[name] = node
         return node
 
+    def switch(self, name: str, ports: int | None = None) -> L2Node:
+        """Declare a switch: a user-named Linux bridge with MAC learning on.
+        Instant, boot-free; ``ports=N`` caps the lazy ``portN`` interfaces."""
+        return self._l2_node(name, OSType.SWITCH, ports)
+
+    def hub(self, name: str, ports: int | None = None) -> L2Node:
+        """Declare a hub: same bridge as a switch, but every port gets
+        ``learning off flood on`` so all frames flood to all ports."""
+        return self._l2_node(name, OSType.HUB, ports)
+
+    def _l2_node(self, name: str, os_type: OSType, ports: int | None) -> L2Node:
+        log.info("Declaring L2 node '%s' (%s, ports=%s)",
+                 name, os_type.value, ports)
+        node = L2Node(name=name, topology=self, os_type=os_type, ports=ports)
+        self._nodes[name] = node
+        return node
+
     def link(self, if_a: InterfaceSpec, if_b: InterfaceSpec,
              **impairments: Any) -> Link:
         log.info("Declaring link: %s/%s [%s] <-> %s/%s [%s] impair=%s",
@@ -200,14 +218,18 @@ class Topology:
         topo = cls(data["name"])
         # First pass: create all nodes (depends_on resolved in second pass).
         for nd in data.get("nodes", []):
-            node = topo.node(
-                nd["name"],
-                image=nd.get("image"),
-                container=nd.get("container"),
-                vcpu=nd.get("vcpu", 1),
-                memory=nd.get("memory", 1024),
-                os=nd.get("os", "linux"),
-            )
+            if nd.get("os") in ("switch", "hub"):
+                node = (topo.switch if nd["os"] == "switch" else topo.hub)(
+                    nd["name"])
+            else:
+                node = topo.node(
+                    nd["name"],
+                    image=nd.get("image"),
+                    container=nd.get("container"),
+                    vcpu=nd.get("vcpu", 1),
+                    memory=nd.get("memory", 1024),
+                    os=nd.get("os", "linux"),
+                )
             # Restore declared interfaces (with IPs if present).
             for iface in nd.get("interfaces", []) or []:
                 node._interfaces[iface["name"]] = InterfaceSpec(
@@ -273,6 +295,11 @@ class Node(DependencyMixin):
     def is_container(self) -> bool:
         return self.container is not None
 
+    @property
+    def is_l2(self) -> bool:
+        """True for boot-free L2 device nodes (switch/hub, Phase 20)."""
+        return self.os_type in (OSType.SWITCH, OSType.HUB)
+
     def __getattr__(self, name: str) -> InterfaceSpec:
         if name.startswith("eth"):
             # __getattr__ is only called when normal lookup fails, so _interfaces
@@ -289,6 +316,92 @@ class Node(DependencyMixin):
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
 
+# Kernel device names are capped at IFNAMSIZ-1 (15) chars; sw-/hub- prefixed
+# bridge names must fit.
+_IFNAMSIZ = 15
+
+
+class L2Node(Node):
+    """A boot-free L2 device (switch or hub) — its "body" is a Linux bridge
+    inside the range netns. No image, no SSH, no mgmt interface; ``portN``
+    interfaces appear lazily like a VM node's ``ethN`` (``ports=`` is only a
+    cap). See design D1-D8 in 20260609-2-phase20-hub-switch-design.md."""
+
+    def __init__(self, name: str, topology: Topology, os_type: OSType,
+                 ports: int | None = None) -> None:
+        super().__init__(
+            name=name,
+            topology=topology,
+            image=None,
+            vcpu=0,
+            memory=0,
+            os_type=os_type,
+            depends_on=[],
+            ready_when=None,
+            container=None,
+        )
+        prefix = "sw" if os_type is OSType.SWITCH else "hub"
+        bridge = f"{prefix}-{name}"
+        if len(bridge) > _IFNAMSIZ:
+            raise ValueError(
+                f"{os_type.value} '{name}': bridge name '{bridge}' exceeds the "
+                f"kernel's {_IFNAMSIZ}-char device-name limit; use a shorter name"
+            )
+        self.ports = ports
+
+    @property
+    def bridge_name(self) -> str:
+        prefix = "sw" if self.os_type is OSType.SWITCH else "hub"
+        return f"{prefix}-{self.name}"
+
+    def __getattr__(self, name: str) -> InterfaceSpec:
+        if name.startswith("port") and name[4:].isdigit():
+            ifaces = self.__dict__.get("_interfaces")
+            if ifaces is None:
+                raise AttributeError(name)
+            cap = self.__dict__.get("ports")
+            index = int(name[4:])
+            if cap is not None and index >= cap:
+                raise ValueError(
+                    f"{self.name} has {cap} ports (port0..port{cap - 1}); "
+                    f"{name} is out of range"
+                )
+            if name not in ifaces:
+                ifaces[name] = InterfaceSpec(
+                    node_name=self.name,
+                    interface_name=name,
+                )
+            return ifaces[name]
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
+
+
+@dataclass
+class LinkEndpoint:
+    """One side of a wired link, generalized for L2 endpoints (Phase 20, D6).
+
+    A VM endpoint carries ``(vm_id, mac)`` and resolves its TAP lazily at use
+    time — libvirt TAP names change across power events, so they are never
+    cached. A veth endpoint (L2<->L2 uplink) carries a static engine-chosen
+    ``dev``. The L2 side of a VM<->L2 link has no device of its own (the VM's
+    TAP attaches straight onto the L2 bridge) and resolves to None.
+    """
+    node_name: str
+    is_l2: bool = False
+    hub: bool = False           # this endpoint's device is a port on a hub
+    bridge: str | None = None   # bridge the endpoint attaches to
+    vm_id: str | None = None
+    mac: str | None = None
+    dev: str | None = None      # static device name (veth ends)
+
+    def resolve(self, backend: Any) -> str | None:
+        """The tc-able device for this endpoint, or None if it has none."""
+        if self.dev:
+            return self.dev
+        if self.vm_id and self.mac:
+            return backend._find_tap_for_mac(self.vm_id, self.mac)
+        return None
+
+
 class Link:
 
     def __init__(self, if_a: InterfaceSpec, if_b: InterfaceSpec, topology: Topology) -> None:
@@ -301,10 +414,13 @@ class Link:
         self._bridge_name: str | None = None
         self._db: Any = None
         self._topology_name: str | None = None
-        # Endpoints needed for Link.up() to re-enslave VM TAPs to the
-        # recreated bridge. Populated by Engine._wire_link as
-        # [(vm_id, mac), (vm_id, mac)].
-        self._endpoints: list[tuple[str, str]] = []
+        # Per-side endpoints (aligned with if_a, if_b), populated by
+        # Engine._wire_link. Used by up() to re-attach devices and by
+        # impair()/clear() to resolve tc targets. See LinkEndpoint.
+        self._endpoints: list[LinkEndpoint] = []
+        # L2<->L2 links are a veth pair joining two bridges instead of a
+        # dedicated link bridge; down()/up() delete/recreate the pair.
+        self._veth_pair: tuple[str, str] | None = None
         # Current tc netem impairments, keyed by endpoint node name. Empty dict
         # per side = clean link. Re-applied after Link.up() recreates the TAPs.
         self._impairments: dict[str, dict] = {}
@@ -316,45 +432,69 @@ class Link:
         log.info("Link down: %s/%s <-> %s/%s",
                  self.if_a.node_name, self.if_a.interface_name,
                  self.if_b.node_name, self.if_b.interface_name)
-        if self._backend is None or self._bridge_name is None:
+        if self._backend is None:
             raise RuntimeError("Link not wired to backend; deploy the topology first")
-        self._backend.delete_bridge(self._bridge_name)
+        if self._veth_pair is not None:
+            # L2<->L2: deleting one veth end removes the pair.
+            self._backend.delete_device(self._veth_pair[0])
+        elif self._bridge_name is not None:
+            self._backend.delete_bridge(self._bridge_name)
+        else:
+            raise RuntimeError("Link not wired to backend; deploy the topology first")
         self._is_up = False
         if self._db is not None and self._topology_name is not None:
             self._db.log_event(self._topology_name, None, "info",
-                               f"link down: {self._bridge_name}")
+                               f"link down: {self._bridge_name or self._veth_pair[0]}")
 
     def up(self) -> None:
         log.info("Link up: %s/%s <-> %s/%s",
                  self.if_a.node_name, self.if_a.interface_name,
                  self.if_b.node_name, self.if_b.interface_name)
-        if self._backend is None or self._bridge_name is None:
+        if self._backend is None:
             raise RuntimeError("Link not wired to backend; deploy the topology first")
-        self._backend.create_bridge(self._bridge_name)
-        # Re-enslave each VM's TAP to the newly recreated bridge. Deleting
-        # the bridge orphaned its slave TAPs; creating a fresh bridge with
-        # the same name does NOT auto-reattach them, so we must do it
-        # explicitly to restore connectivity.
-        for vm_id, mac in self._endpoints:
-            self._backend.attach_interface(vm_id, self._bridge_name, mac)
+        if self._veth_pair is not None:
+            # L2<->L2: recreate the veth pair, re-enslaving each end.
+            veth_a, veth_b = self._veth_pair
+            ep_a, ep_b = self._endpoints
+            self._backend.create_veth_pair(veth_a, veth_b,
+                                           ep_a.bridge, ep_b.bridge)
+        elif self._bridge_name is not None:
+            self._backend.create_bridge(self._bridge_name)
+            # Re-enslave each VM's TAP to the newly recreated bridge. Deleting
+            # the bridge orphaned its slave TAPs; creating a fresh bridge with
+            # the same name does NOT auto-reattach them, so we must do it
+            # explicitly to restore connectivity.
+            for ep in self._endpoints:
+                if ep.vm_id and ep.mac:
+                    self._backend.attach_interface(ep.vm_id, self._bridge_name,
+                                                   ep.mac)
+        else:
+            raise RuntimeError("Link not wired to backend; deploy the topology first")
+        # Hub ports lose their flags with the recreated bridge/veth —
+        # re-apply learning off + flood on after every re-attach.
+        for ep in self._endpoints:
+            if ep.hub:
+                dev = ep.resolve(self._backend)
+                if dev:
+                    self._backend.set_port_flags(dev, learning=False, flood=True)
         self._is_up = True
         # Recreating the bridge reset the TAPs to clean qdiscs — restore any
         # impairments that were in effect before the link went down.
         self._reapply_impairments()
         if self._db is not None and self._topology_name is not None:
             self._db.log_event(self._topology_name, None, "info",
-                               f"link up: {self._bridge_name}")
+                               f"link up: {self._bridge_name or self._veth_pair[0]}")
 
     # --- impairment (Phase 19 — WAN simulation via tc netem) --------------
 
-    def _sides(self) -> list[tuple[str, tuple[str, str]]]:
-        """[(node_name, (vm_id, mac)), ...] — one per endpoint, a then b."""
+    def _sides(self) -> list[tuple[str, LinkEndpoint]]:
+        """[(node_name, endpoint), ...] — one per endpoint, a then b."""
         return [
             (self.if_a.node_name, self._endpoints[0]),
             (self.if_b.node_name, self._endpoints[1]),
         ]
 
-    def _targets(self, outbound: str | None) -> list[tuple[str, tuple[str, str]]]:
+    def _targets(self, outbound: str | None) -> list[tuple[str, LinkEndpoint]]:
         sides = self._sides()
         if outbound is None:
             return sides
@@ -363,6 +503,12 @@ class Link:
             raise ValueError(
                 f"outbound={outbound!r} is not an endpoint of this link "
                 f"({self.if_a.node_name}, {self.if_b.node_name})"
+            )
+        if matched[0][1].is_l2:
+            raise ValueError(
+                f"outbound={outbound!r} is an L2 device (switch/hub); "
+                "egress impairment only applies to VM endpoints — impair "
+                "symmetrically or target the VM side"
             )
         return matched
 
@@ -387,12 +533,16 @@ class Link:
                  self.if_b.node_name, self.if_b.interface_name, params, outbound)
         netns = getattr(self._backend, "_netns_name", None)
         cmds: list[list[str]] = []
-        for node_name, (vm_id, mac) in self._targets(outbound):
-            tap = self._backend._find_tap_for_mac(vm_id, mac)
-            if not tap:
+        for node_name, ep in self._targets(outbound):
+            dev = ep.resolve(self._backend)
+            if not dev:
+                if ep.is_l2:
+                    # VM<->L2: the L2 side has no device of its own — the VM
+                    # TAP (the other side) carries both directions.
+                    continue
                 raise RuntimeError(
-                    f"no TAP found for {node_name} (vm={vm_id} mac={mac})")
-            cmds += build_netem_cmds(tap, netns, **params)
+                    f"no TAP found for {node_name} (vm={ep.vm_id} mac={ep.mac})")
+            cmds += build_netem_cmds(dev, netns, **params)
             self._impairments[node_name] = dict(params)
         self._backend.run_tc(cmds)
 
@@ -406,10 +556,10 @@ class Link:
                  self.if_b.node_name, self.if_b.interface_name, outbound)
         netns = getattr(self._backend, "_netns_name", None)
         cmds: list[list[str]] = []
-        for node_name, (vm_id, mac) in self._targets(outbound):
-            tap = self._backend._find_tap_for_mac(vm_id, mac)
-            if tap:
-                cmds += build_clear_cmds(tap, netns)
+        for node_name, ep in self._targets(outbound):
+            dev = ep.resolve(self._backend)
+            if dev:
+                cmds += build_clear_cmds(dev, netns)
             self._impairments[node_name] = {}
         self._backend.run_tc(cmds)
 
@@ -417,13 +567,13 @@ class Link:
         from rangectl.link_properties import build_netem_cmds
         netns = getattr(self._backend, "_netns_name", None)
         cmds: list[list[str]] = []
-        for node_name, (vm_id, mac) in self._sides():
+        for node_name, ep in self._sides():
             params = self._impairments.get(node_name)
             if not params:
                 continue
-            tap = self._backend._find_tap_for_mac(vm_id, mac)
-            if tap:
-                cmds += build_netem_cmds(tap, netns, **params)
+            dev = ep.resolve(self._backend)
+            if dev:
+                cmds += build_netem_cmds(dev, netns, **params)
         if cmds:
             self._backend.run_tc(cmds)
 
@@ -529,6 +679,14 @@ class Range:
         if os_type is not None:
             kwargs["os"] = os_type
         return self.topology.node(name, image=image, **kwargs)
+
+    def switch(self, name: str, ports: int | None = None) -> L2Node:
+        """Declare a switch (L2 bridge, MAC learning on) on the topology."""
+        return self.topology.switch(name, ports=ports)
+
+    def hub(self, name: str, ports: int | None = None) -> L2Node:
+        """Declare a hub (L2 bridge, all frames flood) on the topology."""
+        return self.topology.hub(name, ports=ports)
 
     def deploy(self, *, backend: Any = None, db: Any = None,
                container_backend: Any = None, use_namespaces: bool | None = None,
@@ -696,7 +854,11 @@ class Range:
         # nodes and route each to the right backend (VM vs container).
         topology = Topology(name, backend=lvb, db=db, container_backend=cb)
         for r in node_rows:
-            if r["os_type"] == "container":
+            if r["os_type"] == "switch":
+                topology.switch(r["name"])
+            elif r["os_type"] == "hub":
+                topology.hub(r["name"])
+            elif r["os_type"] == "container":
                 topology.node(r["name"], container=r["image"],
                               vcpu=r["vcpu"], memory=r["memory_mb"])
             else:
@@ -724,6 +886,10 @@ class Range:
         topology._engine = engine
 
         for r in node_rows:
+            if r["os_type"] in ("switch", "hub"):
+                # L2 devices have no VM, SSH, or power state — nothing to
+                # reconnect; their bridges live in the netns already.
+                continue
             vm_id = r["vm_id"] or f"{name}-{r['name']}"
             mgmt_ip = r["mgmt_ip"]
             engine._vm_ids[(name, r["name"])] = vm_id
@@ -746,10 +912,12 @@ class Range:
             )
 
         # Rebuild links from the DB so impair/clear/down/up work cross-process.
-        # Each Link needs its bridge name, per-range backend, and (vm_id, mac)
-        # endpoints — the same wiring Engine._wire_link does at deploy.
-        from rangectl.engine import _mac_for
-        for lk in db.list_links(name):
+        # Each Link needs its bridge name, per-range backend, and per-side
+        # endpoints — the same wiring Engine._wire_link does at deploy. Link
+        # rows are listed in insertion order, so the row index matches the
+        # deploy-time link index that names L2<->L2 veth ends.
+        from rangectl.engine import _l2_veth_names, _mac_for
+        for link_idx, lk in enumerate(db.list_links(name)):
             if_a = InterfaceSpec(node_name=lk["node_a"],
                                  interface_name=lk["iface_a"], ip=lk["ip_a"])
             if_b = InterfaceSpec(node_name=lk["node_b"],
@@ -760,10 +928,32 @@ class Range:
             link._db = db
             link._topology_name = name
             link._is_up = bool(lk.get("is_up", 1))
-            for side in (if_a, if_b):
-                vm_id = engine._vm_ids[(name, side.node_name)]
-                link._endpoints.append(
-                    (vm_id, _mac_for(name, side.node_name, side.interface_name)))
+            node_a = topology._nodes[if_a.node_name]
+            node_b = topology._nodes[if_b.node_name]
+            if node_a.is_l2 and node_b.is_l2:
+                veth_a, veth_b = _l2_veth_names(name, link_idx)
+                link._veth_pair = (veth_a, veth_b)
+                for side_node, dev in ((node_a, veth_a), (node_b, veth_b)):
+                    link._endpoints.append(LinkEndpoint(
+                        node_name=side_node.name, is_l2=True,
+                        hub=side_node.os_type is OSType.HUB,
+                        bridge=side_node.bridge_name, dev=dev))
+            else:
+                for side in (if_a, if_b):
+                    side_node = topology._nodes[side.node_name]
+                    other = node_b if side_node is node_a else node_a
+                    if side_node.is_l2:
+                        link._endpoints.append(LinkEndpoint(
+                            node_name=side_node.name, is_l2=True,
+                            bridge=lk["bridge_name"]))
+                    else:
+                        link._endpoints.append(LinkEndpoint(
+                            node_name=side_node.name,
+                            hub=other.os_type is OSType.HUB,
+                            bridge=lk["bridge_name"],
+                            vm_id=engine._vm_ids[(name, side.node_name)],
+                            mac=_mac_for(name, side.node_name,
+                                         side.interface_name)))
             topology._links.append(link)
 
         log.info("Reconnected to range '%s' (%d nodes, %d links)",

@@ -24,6 +24,8 @@ class MockBackend:
         self.bridges: set[str] = set()
         self.snapshots: dict[str, dict[str, str]] = defaultdict(dict)
         self.overlays: dict[str, str] = {}
+        self.veths: dict[str, str] = {}  # veth end -> bridge it's enslaved to
+        self.port_flags: dict[str, dict] = {}  # port -> last learning/flood
         self.exec_results: dict[tuple[str, str], ExecResult] = {}
         self.exec_default = ExecResult(exit_code=0, stdout="", stderr="")
         self.host_resources_result = HostResources(
@@ -90,6 +92,21 @@ class MockBackend:
 
     def attach_interface(self, vm_id: str, bridge: str, mac: str) -> None:
         self._record("attach_interface", vm_id, bridge, mac)
+
+    def create_veth_pair(self, name_a: str, name_b: str,
+                         bridge_a: str, bridge_b: str) -> None:
+        self._record("create_veth_pair", name_a, name_b, bridge_a, bridge_b)
+        self.veths[name_a] = bridge_a
+        self.veths[name_b] = bridge_b
+
+    def delete_device(self, name: str) -> None:
+        self._record("delete_device", name)
+        self.veths.pop(name, None)
+
+    def set_port_flags(self, port: str, *, learning: bool,
+                       flood: bool) -> None:
+        self._record("set_port_flags", port, learning=learning, flood=flood)
+        self.port_flags[port] = {"learning": learning, "flood": flood}
 
     def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
         self._record("_find_tap_for_mac", vm_id, mac)

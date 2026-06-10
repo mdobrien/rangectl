@@ -25,7 +25,7 @@ node). `exec` passes through the **remote command's** exit code.
 | Command | Notes |
 |---|---|
 | `list` | ranges + status (running/frozen/orphaned), node count, subnet |
-| `status <range> [--yaml]` | per-node: status, IP, image, OS, vcpu, mem. `--yaml` for scripting |
+| `status <range> [--yaml]` | per-node: status, IP, image, OS, vcpu, mem. `--yaml` for scripting. L2 nodes (os `switch`/`hub`, Phase 20) render their DB state — no power/SSH query, IP/image show `-` |
 | `exec <range> <node> -- <cmd...>` | SSH exec; stdout/stderr passthrough; returns remote exit code |
 | `exec <range> <node> -i` | interactive SSH (`os.execvp ssh`, per-range key) |
 | `upload <range> <node> <src> <dst>` | SFTP upload |
@@ -34,7 +34,7 @@ node). `exec` passes through the **remote command's** exit code.
 | `virsh <range> <args...>` | virsh scoped to the range's libvirt socket (`os.execvp`) |
 | `netns <range> -- <cmd...>` | `ip netns exec rangectl-<range> <cmd>` |
 | `logs <range> [--node N] [--level L]` | DB log events |
-| `net <range>` | netns, mgmt subnet, veth, node IPs, bridges |
+| `net <range>` | netns, mgmt subnet, veth, node IPs, bridges. Lists L2 devices (`sw-<name>`/`hub-<name>` with their enslaved ports via `bridge link show` in the netns) |
 | `ps <range>` | `pstree -p <libvirtd-pid>` from range.json |
 | `freeze` / `thaw <range>` | cgroup freeze/resume (ns mode only) |
 | `snapshot` / `restore <range> <name>` | topology-wide |
