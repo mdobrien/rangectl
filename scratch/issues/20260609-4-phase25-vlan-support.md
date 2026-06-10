@@ -7,6 +7,7 @@
 - **Parent design**: `20260609-2-phase20-hub-switch-design.md` — VLAN option B chosen by user 2026-06-09 (links back here)
 - **Phase 20 spec**: `20260603-4-phase20-hub-switch.md` — the switch node this extends
 - **Plan**: `20260527-1-vm-testbed-platform-design.md` — added as Phase 25
+- **Follow-up**: `20260609-15-vyos-bootstrap-noip-nics.md` — VyOS bootstrap skips address-less NICs; bare trunk parents need a parking IP (found during RAS lab)
 
 ## Goal
 Make the Phase 20 switch a real 802.1Q switch using native Linux **bridge VLAN filtering** — access
