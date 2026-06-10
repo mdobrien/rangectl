@@ -40,6 +40,14 @@ class Backend(Protocol):
     def set_port_flags(self, port: str, *, learning: bool,
                        flood: bool) -> None: ...
 
+    # 802.1Q (Phase 25): vlan_filtering turns a bridge into a real switch
+    # with kernel-enforced VLAN boundaries; per-port membership is then
+    # programmed as access (pvid untagged) or trunk (tagged, multi-VID).
+    def set_vlan_filtering(self, bridge: str, enabled: bool = True) -> None: ...
+
+    def set_port_vlans(self, port: str, *, mode: str, vids: list[int],
+                       native: int | None = None) -> None: ...
+
     # tc runner for link impairment (Phase 19) — commands are pre-built,
     # netns-prefixed argv lists.
     def run_tc(self, cmds: list[list[str]]) -> None: ...

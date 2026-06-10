@@ -15,6 +15,7 @@ from rangectl.types import (
     InterfaceSpec,
     NodeState,
     OSType,
+    PortSpec,
     RangeNotRunning,
     ReadinessProbe,
 )
@@ -112,20 +113,33 @@ class Topology:
         self._nodes[name] = node
         return node
 
-    def switch(self, name: str, ports: int | None = None) -> L2Node:
+    def switch(self, name: str, ports: int | None = None,
+               vlan_aware: bool = False) -> L2Node:
         """Declare a switch: a user-named Linux bridge with MAC learning on.
-        Instant, boot-free; ``ports=N`` caps the lazy ``portN`` interfaces."""
-        return self._l2_node(name, OSType.SWITCH, ports)
+        Instant, boot-free; ``ports=N`` caps the lazy ``portN`` interfaces.
+        ``vlan_aware=True`` enables kernel 802.1Q VLAN filtering — ports can
+        then be configured via ``sw.portN.access(vid)`` / ``.trunk(*vids)``
+        (Phase 25)."""
+        return self._l2_node(name, OSType.SWITCH, ports, vlan_aware)
 
-    def hub(self, name: str, ports: int | None = None) -> L2Node:
+    def hub(self, name: str, ports: int | None = None,
+            vlan_aware: bool = False) -> L2Node:
         """Declare a hub: same bridge as a switch, but every port gets
         ``learning off flood on`` so all frames flood to all ports."""
-        return self._l2_node(name, OSType.HUB, ports)
+        if vlan_aware:
+            raise ValueError(
+                f"hub '{name}': hubs cannot be vlan-aware — flood-everything "
+                "and VLAN filtering are contradictory; use "
+                f"switch('{name}', vlan_aware=True)"
+            )
+        return self._l2_node(name, OSType.HUB, ports, False)
 
-    def _l2_node(self, name: str, os_type: OSType, ports: int | None) -> L2Node:
-        log.info("Declaring L2 node '%s' (%s, ports=%s)",
-                 name, os_type.value, ports)
-        node = L2Node(name=name, topology=self, os_type=os_type, ports=ports)
+    def _l2_node(self, name: str, os_type: OSType, ports: int | None,
+                 vlan_aware: bool = False) -> L2Node:
+        log.info("Declaring L2 node '%s' (%s, ports=%s, vlan_aware=%s)",
+                 name, os_type.value, ports, vlan_aware)
+        node = L2Node(name=name, topology=self, os_type=os_type, ports=ports,
+                      vlan_aware=vlan_aware)
         self._nodes[name] = node
         return node
 
@@ -196,6 +210,8 @@ class Topology:
                     for k, v in node._interfaces.items()
                 ],
             }
+            if node.is_l2:
+                node_data["vlan_aware"] = getattr(node, "vlan_aware", False)
             data["nodes"].append(node_data)
         for lnk in self._links:
             data["links"].append({
@@ -205,6 +221,8 @@ class Topology:
                 "node_b": lnk.if_b.node_name,
                 "iface_b": lnk.if_b.interface_name,
                 "ip_b": f"{lnk.if_b.ip}/{lnk.if_b.cidr}" if lnk.if_b.ip else None,
+                "vlan_a": getattr(lnk.if_a, "vlan", None),
+                "vlan_b": getattr(lnk.if_b, "vlan", None),
             })
         with open(path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)
@@ -218,9 +236,11 @@ class Topology:
         topo = cls(data["name"])
         # First pass: create all nodes (depends_on resolved in second pass).
         for nd in data.get("nodes", []):
-            if nd.get("os") in ("switch", "hub"):
-                node = (topo.switch if nd["os"] == "switch" else topo.hub)(
-                    nd["name"])
+            if nd.get("os") == "switch":
+                node = topo.switch(nd["name"],
+                                   vlan_aware=nd.get("vlan_aware", False))
+            elif nd.get("os") == "hub":
+                node = topo.hub(nd["name"])
             else:
                 node = topo.node(
                     nd["name"],
@@ -230,7 +250,11 @@ class Topology:
                     memory=nd.get("memory", 1024),
                     os=nd.get("os", "linux"),
                 )
-            # Restore declared interfaces (with IPs if present).
+            # Restore declared interfaces (with IPs if present). L2 ports are
+            # skipped: they recreate lazily as PortSpecs (with their owning
+            # node wired in), and link restoration re-applies VLAN config.
+            if node.is_l2:
+                continue
             for iface in nd.get("interfaces", []) or []:
                 node._interfaces[iface["name"]] = InterfaceSpec(
                     node_name=node.name,
@@ -242,16 +266,25 @@ class Topology:
         for nd in data.get("nodes", []):
             node = topo._nodes[nd["name"]]
             node.depends_on = [topo._nodes[d] for d in nd.get("depends_on", [])]
-        # Recreate links.
+        # Recreate links (re-applying any 802.1Q port config, Phase 25).
+        def _apply_vlan(spec: InterfaceSpec, vlan: dict | None) -> InterfaceSpec:
+            if not vlan:
+                return spec
+            if vlan["mode"] == "access":
+                return spec.access(vlan["vids"][0])
+            return spec.trunk(*vlan["vids"], native=vlan.get("native"))
+
         for lnk in data.get("links", []) or []:
             node_a = topo._nodes[lnk["node_a"]]
             if_a = getattr(node_a, lnk["iface_a"])
             if lnk.get("ip_a"):
                 if_a = if_a[lnk["ip_a"]]
+            if_a = _apply_vlan(if_a, lnk.get("vlan_a"))
             node_b = topo._nodes[lnk["node_b"]]
             if_b = getattr(node_b, lnk["iface_b"])
             if lnk.get("ip_b"):
                 if_b = if_b[lnk["ip_b"]]
+            if_b = _apply_vlan(if_b, lnk.get("vlan_b"))
             topo.link(if_a, if_b)
         return topo
 
@@ -328,7 +361,7 @@ class L2Node(Node):
     cap). See design D1-D8 in 20260609-2-phase20-hub-switch-design.md."""
 
     def __init__(self, name: str, topology: Topology, os_type: OSType,
-                 ports: int | None = None) -> None:
+                 ports: int | None = None, vlan_aware: bool = False) -> None:
         super().__init__(
             name=name,
             topology=topology,
@@ -348,6 +381,9 @@ class L2Node(Node):
                 f"kernel's {_IFNAMSIZ}-char device-name limit; use a shorter name"
             )
         self.ports = ports
+        # 802.1Q VLAN filtering (Phase 25). Only switches; hub+vlan_aware is
+        # rejected at Topology.hub().
+        self.vlan_aware = vlan_aware
 
     @property
     def bridge_name(self) -> str:
@@ -367,9 +403,10 @@ class L2Node(Node):
                     f"{name} is out of range"
                 )
             if name not in ifaces:
-                ifaces[name] = InterfaceSpec(
+                ifaces[name] = PortSpec(
                     node_name=self.name,
                     interface_name=name,
+                    l2_node=self,
                 )
             return ifaces[name]
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
@@ -392,6 +429,12 @@ class LinkEndpoint:
     vm_id: str | None = None
     mac: str | None = None
     dev: str | None = None      # static device name (veth ends)
+    # 802.1Q port config to (re-)apply to this endpoint's device (Phase 25):
+    # {"mode": "access"|"trunk", "vids": [...], "native": int|None} or None.
+    vlan: dict | None = None
+    # True on the L2 endpoint of a vlan-aware switch: Link.up() must re-enable
+    # vlan_filtering after recreating the bridge.
+    bridge_vlan_aware: bool = False
 
     def resolve(self, backend: Any) -> str | None:
         """The tc-able device for this endpoint, or None if it has none."""
@@ -460,6 +503,11 @@ class Link:
                                            ep_a.bridge, ep_b.bridge)
         elif self._bridge_name is not None:
             self._backend.create_bridge(self._bridge_name)
+            # The recreated bridge comes up with VLAN filtering off — restore
+            # it before re-attaching ports on a vlan-aware switch (Phase 25).
+            if any(ep.bridge_vlan_aware for ep in self._endpoints):
+                self._backend.set_vlan_filtering(self._bridge_name,
+                                                 enabled=True)
             # Re-enslave each VM's TAP to the newly recreated bridge. Deleting
             # the bridge orphaned its slave TAPs; creating a fresh bridge with
             # the same name does NOT auto-reattach them, so we must do it
@@ -470,13 +518,18 @@ class Link:
                                                    ep.mac)
         else:
             raise RuntimeError("Link not wired to backend; deploy the topology first")
-        # Hub ports lose their flags with the recreated bridge/veth —
-        # re-apply learning off + flood on after every re-attach.
+        # Hub flags and VLAN port config live on the bridge port, so both are
+        # lost with the recreated bridge/veth — re-apply after every re-attach.
         for ep in self._endpoints:
+            if not (ep.hub or ep.vlan):
+                continue
+            dev = ep.resolve(self._backend)
+            if not dev:
+                continue
             if ep.hub:
-                dev = ep.resolve(self._backend)
-                if dev:
-                    self._backend.set_port_flags(dev, learning=False, flood=True)
+                self._backend.set_port_flags(dev, learning=False, flood=True)
+            if ep.vlan:
+                self._backend.set_port_vlans(dev, **ep.vlan)
         self._is_up = True
         # Recreating the bridge reset the TAPs to clean qdiscs — restore any
         # impairments that were in effect before the link went down.
@@ -680,13 +733,15 @@ class Range:
             kwargs["os"] = os_type
         return self.topology.node(name, image=image, **kwargs)
 
-    def switch(self, name: str, ports: int | None = None) -> L2Node:
+    def switch(self, name: str, ports: int | None = None,
+               vlan_aware: bool = False) -> L2Node:
         """Declare a switch (L2 bridge, MAC learning on) on the topology."""
-        return self.topology.switch(name, ports=ports)
+        return self.topology.switch(name, ports=ports, vlan_aware=vlan_aware)
 
-    def hub(self, name: str, ports: int | None = None) -> L2Node:
+    def hub(self, name: str, ports: int | None = None,
+            vlan_aware: bool = False) -> L2Node:
         """Declare a hub (L2 bridge, all frames flood) on the topology."""
-        return self.topology.hub(name, ports=ports)
+        return self.topology.hub(name, ports=ports, vlan_aware=vlan_aware)
 
     def deploy(self, *, backend: Any = None, db: Any = None,
                container_backend: Any = None, use_namespaces: bool | None = None,
@@ -852,10 +907,14 @@ class Range:
 
         # Rebuild a Topology with Node objects so engine.destroy() can iterate
         # nodes and route each to the right backend (VM vs container).
+        # vlan_aware switches are recognized by their bridge row (Phase 25).
+        vlan_bridges = {b["name"] for b in db.list_bridges(name)
+                        if b.get("vlan_aware")}
         topology = Topology(name, backend=lvb, db=db, container_backend=cb)
         for r in node_rows:
             if r["os_type"] == "switch":
-                topology.switch(r["name"])
+                topology.switch(r["name"],
+                                vlan_aware=f"sw-{r['name']}" in vlan_bridges)
             elif r["os_type"] == "hub":
                 topology.hub(r["name"])
             elif r["os_type"] == "container":
@@ -930,30 +989,42 @@ class Range:
             link._is_up = bool(lk.get("is_up", 1))
             node_a = topology._nodes[if_a.node_name]
             node_b = topology._nodes[if_b.node_name]
+            # Per-port 802.1Q config persisted at deploy (Phase 25). The
+            # column belongs to the side that owns the port spec.
+            vlan_a = json.loads(lk["vlan_a"]) if lk.get("vlan_a") else None
+            vlan_b = json.loads(lk["vlan_b"]) if lk.get("vlan_b") else None
             if node_a.is_l2 and node_b.is_l2:
                 veth_a, veth_b = _l2_veth_names(name, link_idx)
                 link._veth_pair = (veth_a, veth_b)
-                for side_node, dev in ((node_a, veth_a), (node_b, veth_b)):
+                for side_node, dev, vlan in ((node_a, veth_a, vlan_a),
+                                             (node_b, veth_b, vlan_b)):
                     link._endpoints.append(LinkEndpoint(
                         node_name=side_node.name, is_l2=True,
                         hub=side_node.os_type is OSType.HUB,
-                        bridge=side_node.bridge_name, dev=dev))
+                        bridge=side_node.bridge_name, dev=dev, vlan=vlan,
+                        bridge_vlan_aware=getattr(side_node, "vlan_aware",
+                                                  False)))
             else:
-                for side in (if_a, if_b):
+                for side, other_vlan in ((if_a, vlan_b), (if_b, vlan_a)):
                     side_node = topology._nodes[side.node_name]
                     other = node_b if side_node is node_a else node_a
                     if side_node.is_l2:
                         link._endpoints.append(LinkEndpoint(
                             node_name=side_node.name, is_l2=True,
-                            bridge=lk["bridge_name"]))
+                            bridge=lk["bridge_name"],
+                            bridge_vlan_aware=getattr(side_node, "vlan_aware",
+                                                      False)))
                     else:
+                        # The VM's TAP is the bridge port, so the L2 side's
+                        # port config applies to it.
                         link._endpoints.append(LinkEndpoint(
                             node_name=side_node.name,
                             hub=other.os_type is OSType.HUB,
                             bridge=lk["bridge_name"],
                             vm_id=engine._vm_ids[(name, side.node_name)],
                             mac=_mac_for(name, side.node_name,
-                                         side.interface_name)))
+                                         side.interface_name),
+                            vlan=other_vlan if other.is_l2 else None))
             topology._links.append(link)
 
         log.info("Reconnected to range '%s' (%d nodes, %d links)",

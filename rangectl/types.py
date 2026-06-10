@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable
+from typing import Any, Callable
 
 
 class ResourceError(Exception):
@@ -113,6 +113,71 @@ class InterfaceSpec:
             bridge=self.bridge,
             mac=self.mac,
         )
+
+
+def _validate_vid(vid: Any) -> None:
+    """802.1Q VIDs are 1-4094 (0 and 4095 are reserved by the standard)."""
+    if not isinstance(vid, int) or isinstance(vid, bool) or not 1 <= vid <= 4094:
+        raise ValueError(f"invalid VLAN VID {vid!r}: must be an integer 1-4094")
+
+
+@dataclass
+class PortSpec(InterfaceSpec):
+    """A port on an L2 device (switch/hub) — Phase 25.
+
+    On a ``vlan_aware=True`` switch a port is configured as either an
+    **access** port (one VLAN, untagged on the wire, PVID on ingress) or a
+    **trunk** port (multiple tagged VLANs; ``native=`` maps untagged frames
+    to that VID). A port is access XOR trunk. Unconfigured ports keep the
+    kernel bridge default: PVID 1, untagged.
+    """
+    l2_node: Any = field(default=None, repr=False, compare=False)
+    # {"mode": "access"|"trunk", "vids": [int, ...], "native": int|None}
+    vlan: dict | None = None
+
+    def _require_vlan_aware(self, method: str) -> None:
+        node = self.l2_node
+        if node is None or not getattr(node, "vlan_aware", False):
+            kind = node.os_type.value if node is not None else "device"
+            raise ValueError(
+                f"{self.node_name}.{self.interface_name}.{method}(): "
+                f"{kind} '{self.node_name}' is not vlan-aware; declare it "
+                f"with switch('{self.node_name}', vlan_aware=True)"
+            )
+
+    def _reject_reconfigure(self) -> None:
+        if self.vlan is not None:
+            raise ValueError(
+                f"{self.node_name}.{self.interface_name} is already "
+                f"configured as {self.vlan['mode']} "
+                f"(vids={self.vlan['vids']}); a port is access XOR trunk"
+            )
+
+    def access(self, vid: int) -> PortSpec:
+        """Make this an access port: untagged member of ``vid``, PVID set."""
+        self._require_vlan_aware("access")
+        _validate_vid(vid)
+        self._reject_reconfigure()
+        self.vlan = {"mode": "access", "vids": [int(vid)], "native": None}
+        return self
+
+    def trunk(self, *vids: int, native: int | None = None) -> PortSpec:
+        """Make this a trunk port carrying ``vids`` tagged; untagged frames
+        map to ``native`` if given (otherwise they are dropped)."""
+        self._require_vlan_aware("trunk")
+        if not vids:
+            raise ValueError(
+                f"{self.node_name}.{self.interface_name}.trunk() requires "
+                "at least one VID"
+            )
+        for v in vids:
+            _validate_vid(v)
+        if native is not None:
+            _validate_vid(native)
+        self._reject_reconfigure()
+        self.vlan = {"mode": "trunk", "vids": [int(v) for v in vids],
+                     "native": native}
+        return self
 
 
 @dataclass

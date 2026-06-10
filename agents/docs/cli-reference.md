@@ -34,7 +34,7 @@ node). `exec` passes through the **remote command's** exit code.
 | `virsh <range> <args...>` | virsh scoped to the range's libvirt socket (`os.execvp`) |
 | `netns <range> -- <cmd...>` | `ip netns exec rangectl-<range> <cmd>` |
 | `logs <range> [--node N] [--level L]` | DB log events |
-| `net <range>` | netns, mgmt subnet, veth, node IPs, bridges. Lists L2 devices (`sw-<name>`/`hub-<name>` with their enslaved ports via `bridge link show` in the netns) |
+| `net <range>` | netns, mgmt subnet, veth, node IPs, bridges. Lists L2 devices (`sw-<name>`/`hub-<name>` with their enslaved ports via `bridge link show` in the netns). vlan-aware switches (Phase 25) get a per-port VLAN table: `access <vid>` / `trunk <vids>[ native <vid>]` per configured port, a note that unconfigured ports default to PVID 1 untagged, plus the live `bridge vlan show` from inside the netns |
 | `ps <range>` | `pstree -p <libvirtd-pid>` from range.json |
 | `freeze` / `thaw <range>` | cgroup freeze/resume (ns mode only) |
 | `snapshot` / `restore <range> <name>` | topology-wide |

@@ -1,5 +1,6 @@
 from __future__ import annotations
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -298,10 +299,17 @@ class Engine:
                            f"provisioning ({node.os_type.value})")
 
         bridge = node.bridge_name
-        self._vm_backend(topology.name).create_bridge(bridge)
+        vlan_aware = getattr(node, "vlan_aware", False)
+        vm_backend = self._vm_backend(topology.name)
+        vm_backend.create_bridge(bridge)
+        if vlan_aware:
+            # 802.1Q switch (Phase 25): the kernel keeps a VLAN table per
+            # port and enforces membership — guests can't opt out.
+            vm_backend.set_vlan_filtering(bridge, enabled=True)
         self._db._conn.execute(
-            "INSERT INTO bridges (topology_name, name, bridge_type) VALUES (?, ?, ?)",
-            (topology.name, bridge, node.os_type.value),
+            "INSERT INTO bridges (topology_name, name, bridge_type, vlan_aware) "
+            "VALUES (?, ?, ?, ?)",
+            (topology.name, bridge, node.os_type.value, int(vlan_aware)),
         )
         self._db._conn.commit()
         # Track for legacy-mode teardown (in ns mode the bridge dies with the
@@ -814,11 +822,18 @@ class Engine:
                  link.if_b.node_name, link.if_b.interface_name,
                  br or "veth pair")
 
+        # 802.1Q port config declared on either side's PortSpec (Phase 25).
+        # Persisted as JSON so Range.connect() and the CLI can rebuild it.
+        vlan_a = getattr(link.if_a, "vlan", None)
+        vlan_b = getattr(link.if_b, "vlan", None)
         self._db._conn.execute(
             "INSERT INTO links (topology_name, node_a, iface_a, ip_a, "
-            "node_b, iface_b, ip_b, bridge_name) VALUES (?,?,?,?,?,?,?,?)",
+            "node_b, iface_b, ip_b, bridge_name, vlan_a, vlan_b) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
             (topology.name, link.if_a.node_name, link.if_a.interface_name, link.if_a.ip,
-             link.if_b.node_name, link.if_b.interface_name, link.if_b.ip, br),
+             link.if_b.node_name, link.if_b.interface_name, link.if_b.ip, br,
+             json.dumps(vlan_a) if vlan_a else None,
+             json.dumps(vlan_b) if vlan_b else None),
         )
         self._db._conn.commit()
 
@@ -841,30 +856,41 @@ class Engine:
             vm_backend.create_veth_pair(veth_a, veth_b,
                                         node_a.bridge_name, node_b.bridge_name)
             link._veth_pair = (veth_a, veth_b)
-            for side_node, dev in ((node_a, veth_a), (node_b, veth_b)):
+            for side_node, dev, vlan in ((node_a, veth_a, vlan_a),
+                                         (node_b, veth_b, vlan_b)):
                 ep = LinkEndpoint(node_name=side_node.name, is_l2=True,
                                   hub=side_node.os_type is OSType.HUB,
-                                  bridge=side_node.bridge_name, dev=dev)
+                                  bridge=side_node.bridge_name, dev=dev,
+                                  vlan=vlan,
+                                  bridge_vlan_aware=getattr(
+                                      side_node, "vlan_aware", False))
                 if ep.hub:
                     vm_backend.set_port_flags(dev, learning=False, flood=True)
+                if ep.vlan:
+                    # Program this veth end's VLAN membership on its own
+                    # bridge (uplink trunks between vlan-aware switches).
+                    vm_backend.set_port_vlans(dev, **ep.vlan)
                 link._endpoints.append(ep)
         else:
             # VM<->VM (dedicated data bridge) or VM<->L2 (the L2 node's own
             # bridge). Attach each VM/container side; the L2 side has no
             # device of its own — the bridge IS the node.
-            for side in (link.if_a, link.if_b):
+            for side, other_vlan in ((link.if_a, vlan_b), (link.if_b, vlan_a)):
                 side_node = topology._nodes[side.node_name]
                 other = node_b if side_node is node_a else node_a
                 if side_node.is_l2:
                     link._endpoints.append(LinkEndpoint(
-                        node_name=side_node.name, is_l2=True, bridge=br))
+                        node_name=side_node.name, is_l2=True, bridge=br,
+                        bridge_vlan_aware=getattr(side_node, "vlan_aware",
+                                                  False)))
                     continue
                 vm_id = self._vm_ids[(topology.name, side.node_name)]
                 mac = _mac_for(topology.name, side.node_name,
                                side.interface_name)
                 ep = LinkEndpoint(node_name=side_node.name,
                                   hub=other.os_type is OSType.HUB,
-                                  bridge=br, vm_id=vm_id, mac=mac)
+                                  bridge=br, vm_id=vm_id, mac=mac,
+                                  vlan=other_vlan if other.is_l2 else None)
                 link._endpoints.append(ep)
                 # LibvirtBackend uses this to ensure the VM's TAP is enslaved
                 # to the bridge (idempotent during initial deploy; load-bearing
@@ -880,6 +906,13 @@ class Engine:
                     if dev:
                         vm_backend.set_port_flags(dev, learning=False,
                                                   flood=True)
+                if ep.vlan:
+                    # The VM's TAP is the switch port: program its access/
+                    # trunk membership (Phase 25). The L2 side declared the
+                    # config; the TAP carries it.
+                    dev = ep.resolve(vm_backend)
+                    if dev:
+                        vm_backend.set_port_vlans(dev, **ep.vlan)
 
         for side in (link.if_a, link.if_b):
             node = topology._nodes[side.node_name]

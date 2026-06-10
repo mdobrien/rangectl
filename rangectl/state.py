@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS bridges (
     name TEXT NOT NULL,
     subnet TEXT,
     bridge_type TEXT NOT NULL,  -- 'mgmt' or 'topology'
+    vlan_aware INTEGER NOT NULL DEFAULT 0,  -- 802.1Q switch (Phase 25)
     -- Namespace-scoped bridge names (data-0, mgmt-br) repeat across ranges,
     -- so uniqueness is per-topology, not global. Legacy hashed names are
     -- globally unique anyway, so this is strictly looser.
@@ -56,7 +57,11 @@ CREATE TABLE IF NOT EXISTS links (
     iface_b TEXT NOT NULL,
     ip_b TEXT,
     bridge_name TEXT,
-    is_up BOOLEAN DEFAULT 1
+    is_up BOOLEAN DEFAULT 1,
+    -- Per-side 802.1Q port config as JSON (Phase 25):
+    -- {"mode": "access"|"trunk", "vids": [...], "native": int|null}
+    vlan_a TEXT,
+    vlan_b TEXT
 );
 
 CREATE TABLE IF NOT EXISTS mgmt_subnets (
@@ -124,9 +129,25 @@ class StateDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
 
+    # Columns added after a table first shipped. CREATE TABLE IF NOT EXISTS
+    # never alters an existing table, so each is back-filled with ALTER TABLE
+    # (a duplicate-column error means the column is already there).
+    _MIGRATIONS = [
+        ("bridges", "vlan_aware", "INTEGER NOT NULL DEFAULT 0"),
+        ("links", "vlan_a", "TEXT"),
+        ("links", "vlan_b", "TEXT"),
+    ]
+
     def _init_schema(self) -> None:
         log.info("Initializing DB schema")
         self._conn.executescript(SCHEMA)
+        for table, column, decl in self._MIGRATIONS:
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError:
+                pass  # column already present (fresh schema or migrated)
+        self._conn.commit()
 
     def allocate_mgmt_subnet(self, topology_name: str) -> str:
         log.info("Allocating mgmt subnet for topology '%s'", topology_name)

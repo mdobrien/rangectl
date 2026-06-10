@@ -447,7 +447,7 @@ def test_list_bridges(db):
     rows = db.list_bridges("lab")
     assert rows == [{"id": rows[0]["id"], "topology_name": "lab",
                      "name": "sw-core", "subnet": None,
-                     "bridge_type": "switch"}]
+                     "bridge_type": "switch", "vlan_aware": 0}]
 
 
 # --- Range.connect rebuild (D8) -------------------------------------------------

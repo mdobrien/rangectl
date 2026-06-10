@@ -26,6 +26,8 @@ class MockBackend:
         self.overlays: dict[str, str] = {}
         self.veths: dict[str, str] = {}  # veth end -> bridge it's enslaved to
         self.port_flags: dict[str, dict] = {}  # port -> last learning/flood
+        self.vlan_filtering: dict[str, bool] = {}  # bridge -> filtering on
+        self.port_vlans: dict[str, dict] = {}  # port -> last mode/vids/native
         self.exec_results: dict[tuple[str, str], ExecResult] = {}
         self.exec_default = ExecResult(exit_code=0, stdout="", stderr="")
         self.host_resources_result = HostResources(
@@ -107,6 +109,17 @@ class MockBackend:
                        flood: bool) -> None:
         self._record("set_port_flags", port, learning=learning, flood=flood)
         self.port_flags[port] = {"learning": learning, "flood": flood}
+
+    def set_vlan_filtering(self, bridge: str, enabled: bool = True) -> None:
+        self._record("set_vlan_filtering", bridge, enabled=enabled)
+        self.vlan_filtering[bridge] = enabled
+
+    def set_port_vlans(self, port: str, *, mode: str, vids: list[int],
+                       native: int | None = None) -> None:
+        self._record("set_port_vlans", port, mode=mode, vids=list(vids),
+                     native=native)
+        self.port_vlans[port] = {"mode": mode, "vids": list(vids),
+                                 "native": native}
 
     def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
         self._record("_find_tap_for_mac", vm_id, mac)

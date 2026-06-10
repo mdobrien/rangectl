@@ -570,6 +570,50 @@ class LibvirtBackend:
                 _run(self._ip("bridge", "fdb", "del", fields[0],
                               "dev", port, "master"), check=False)
 
+    def set_vlan_filtering(self, bridge: str, enabled: bool = True) -> None:
+        """Toggle kernel 802.1Q VLAN filtering on a bridge (Phase 25). With
+        filtering on, the bridge keeps a VLAN table per port and only forwards
+        frames between ports sharing the VID."""
+        log.info("set_vlan_filtering: %s enabled=%s (netns=%s)",
+                 bridge, enabled, self._netns_name)
+        _run(self._ip("ip", "link", "set", bridge, "type", "bridge",
+                      "vlan_filtering", "1" if enabled else "0"))
+
+    def set_port_vlans(self, port: str, *, mode: str, vids: list[int],
+                       native: int | None = None) -> None:
+        """Program a bridge port's 802.1Q membership (Phase 25).
+
+        - access: ``vid N pvid untagged`` — untagged wire, PVID on ingress.
+        - trunk: ``vid N`` per VID (tags pass through); ``native`` adds a
+          ``pvid untagged`` VID for untagged frames.
+
+        The kernel's default VID 1 is removed unless explicitly configured,
+        so the port carries exactly what was declared. Uses only per-entry
+        ``bridge vlan add/del`` — fine on iproute2 5.15 (no 6.1-only
+        subcommands; see 20260609-13 for the Phase 20 lesson)."""
+        if mode not in ("access", "trunk"):
+            raise ValueError(f"set_port_vlans: unknown mode {mode!r}")
+        log.info("set_port_vlans: %s mode=%s vids=%s native=%s (netns=%s)",
+                 port, mode, vids, native, self._netns_name)
+        configured = set(vids) | ({native} if native is not None else set())
+        if 1 not in configured:
+            # Best-effort: a fresh port always has vid 1, but a re-applied
+            # config (Link.up) may already have dropped it.
+            _run(self._ip("bridge", "vlan", "del", "dev", port, "vid", "1"),
+                 check=False)
+        if mode == "access":
+            _run(self._ip("bridge", "vlan", "add", "dev", port,
+                          "vid", str(vids[0]), "pvid", "untagged"))
+        else:
+            for vid in vids:
+                if native is not None and vid == native:
+                    continue  # programmed below with pvid untagged
+                _run(self._ip("bridge", "vlan", "add", "dev", port,
+                              "vid", str(vid)))
+            if native is not None:
+                _run(self._ip("bridge", "vlan", "add", "dev", port,
+                              "vid", str(native), "pvid", "untagged"))
+
     def run_tc(self, cmds: list[list[str]]) -> None:
         """Run pre-built tc commands (each a full argv, netns-prefixed by the
         caller). Tolerant of failures — clearing a clean link or replacing an

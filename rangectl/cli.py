@@ -223,6 +223,41 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_vlan_table(bridge: str, links: list[dict], netns: str) -> None:
+    """Per-port 802.1Q config of a vlan-aware switch (Phase 25): declared
+    config from the links table, plus the live kernel VLAN table when
+    readable. Unconfigured ports keep the bridge default (PVID 1)."""
+    import json
+    import subprocess
+    node_name = bridge.split("-", 1)[1]
+    print("      vlans:")
+    for lk in links:
+        for me, other in (("a", "b"), ("b", "a")):
+            if lk[f"node_{me}"] != node_name:
+                continue
+            cfg_raw = lk.get(f"vlan_{me}")
+            peer = f"{lk[f'node_{other}']}/{lk[f'iface_{other}']}"
+            if not cfg_raw:
+                desc = "default (pvid 1, untagged)"
+            else:
+                cfg = json.loads(cfg_raw)
+                if cfg["mode"] == "access":
+                    desc = f"access {cfg['vids'][0]}"
+                else:
+                    desc = "trunk " + ",".join(str(v) for v in cfg["vids"])
+                    if cfg.get("native") is not None:
+                        desc += f" native {cfg['native']}"
+            print(f"        {lk[f'iface_{me}']:<8} <- {peer:<16} {desc}")
+    print("        (unconfigured ports default to pvid 1, untagged)")
+    res = subprocess.run(
+        ["ip", "netns", "exec", netns, "bridge", "vlan", "show"],
+        capture_output=True, text=True)
+    if res.returncode == 0 and res.stdout.strip():
+        print("      live vlan table (bridge vlan show):")
+        for line in res.stdout.strip().splitlines():
+            print(f"        {line}")
+
+
 def cmd_net(args: argparse.Namespace) -> int:
     rng = Range.connect(args.range)
     info = _require_range_info(args.range)
@@ -256,9 +291,16 @@ def cmd_net(args: argparse.Namespace) -> int:
                 master = fields[fields.index("master") + 1]
                 ports_by_bridge.setdefault(master, []).append(dev)
         print("  l2 devices:")
+        links: list[dict] | None = None  # fetched only if a vlan-aware switch exists
         for b in l2_bridges:
             ports = ", ".join(ports_by_bridge.get(b["name"], [])) or "-"
-            print(f"    {b['name']:<12} ({b['bridge_type']})  ports: {ports}")
+            vlan_aware = bool(b.get("vlan_aware"))
+            label = b["bridge_type"] + (", vlan-aware" if vlan_aware else "")
+            print(f"    {b['name']:<12} ({label})  ports: {ports}")
+            if vlan_aware:
+                if links is None:
+                    links = rng._db.list_links(rng.name)
+                _print_vlan_table(b["name"], links, netns)
     res = subprocess.run(
         ["ip", "netns", "exec", netns, "ip", "-o", "link", "show",
          "type", "bridge"],
