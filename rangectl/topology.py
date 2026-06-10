@@ -192,6 +192,18 @@ class Topology:
             live._db = self._db
         return rng
 
+    def diagram(self, path: str, fmt: str = "svg",
+                include_mgmt: bool = False) -> str:
+        """Render this topology as a picture (svg/png) or DOT source.
+
+        Works on a pure definition — no deploy, no StateDB required.
+        Returns the output path.
+        """
+        from rangectl.diagram import build_dot, render
+        log.info("Rendering diagram of '%s' to %s (%s)", self.name, path, fmt)
+        return str(render(build_dot(self, include_mgmt=include_mgmt),
+                          path, fmt=fmt))
+
     def export(self, path: str) -> None:
         import yaml
         log.info("Exporting topology '%s' to %s", self.name, path)
@@ -809,6 +821,22 @@ class Range:
         """Declare a hub (L2 bridge, all frames flood) on the topology."""
         return self.topology.hub(name, ports=ports, vlan_aware=vlan_aware)
 
+    def define(self) -> "Range":
+        """Run only the declarative phase (define_nodes + define_network) so
+        the topology can be inspected or diagrammed without deploying.
+        Idempotent; a no-op on live handles and already-defined subclasses."""
+        if self._lifecycle and not self.topology._nodes:
+            self.define_nodes()
+            self.define_network()
+        return self
+
+    def diagram(self, path: str, fmt: str = "svg",
+                include_mgmt: bool = False) -> str:
+        """Render the range's topology to a picture. Works pre-deploy: the
+        declarative phase is run automatically if it hasn't been yet."""
+        self.define()
+        return self.topology.diagram(path, fmt=fmt, include_mgmt=include_mgmt)
+
     def deploy(self, *, backend: Any = None, db: Any = None,
                container_backend: Any = None, use_namespaces: bool | None = None,
                cleanup_on_fail: bool = True) -> "Range":
@@ -831,9 +859,9 @@ class Range:
             )
         from rangectl.engine import Engine
 
-        # 1. Declarative phase — populate the internal topology.
-        self.define_nodes()
-        self.define_network()
+        # 1. Declarative phase — populate the internal topology (idempotent,
+        # so a pre-deploy diagram()/define() doesn't double-declare).
+        self.define()
 
         # 2. Resolve backends. Injected backend == test mode == no namespaces.
         testing = backend is not None

@@ -315,6 +315,22 @@ def cmd_net(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_diagram(args: argparse.Namespace) -> int:
+    """Render a topology picture: deployed range (by name) or YAML file."""
+    if args.file:
+        from rangectl.topology import Topology
+        topo = Topology.from_yaml(args.file)
+    elif args.range:
+        topo = Range.connect(args.range).topology
+    else:
+        _err("diagram requires a range name or --file <topology.yaml>")
+        return 1
+    out = args.output or f"{topo.name}.{args.format}"
+    path = topo.diagram(out, fmt=args.format, include_mgmt=args.mgmt)
+    print(f"Diagram written to {path}")
+    return 0
+
+
 def cmd_ps(args: argparse.Namespace) -> int:
     info = _require_range_info(args.range)
     pid = info["pid"]
@@ -666,6 +682,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("net", help="network topology summary")
     p.add_argument("range")
     p.set_defaults(func=cmd_net)
+
+    p = sub.add_parser("diagram", help="render a topology picture (graphviz)")
+    p.add_argument("range", nargs="?", help="deployed range name")
+    p.add_argument("--file", help="topology YAML (no deployment needed)")
+    p.add_argument("-o", "--output", help="output path "
+                                          "(default: <name>.<format>)")
+    p.add_argument("--format", choices=["svg", "png", "dot"], default="svg")
+    p.add_argument("--mgmt", action="store_true",
+                   help="include the implicit eth0 mgmt NIC in node tables")
+    p.set_defaults(func=cmd_diagram)
 
     p = sub.add_parser("ps", help="process tree inside the range's PID namespace")
     p.add_argument("range")
