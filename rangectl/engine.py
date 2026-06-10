@@ -757,6 +757,14 @@ class Engine:
             # to release first, otherwise install races with first-boot
             # `unattended-upgrades`.
             backend.exec(vm_id, "cloud-init status --wait || true")
+            # Refresh the package index first: cloud images ship a stale baked
+            # index whose package versions may no longer exist on the mirrors
+            # (apt-get install would 404). Best-effort — install is the gate.
+            backend.exec(
+                vm_id,
+                "sudo DEBIAN_FRONTEND=noninteractive apt-get update"
+                " -o Acquire::Retries=3 || true",
+            )
             r = backend.exec(
                 vm_id,
                 f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y {pkg_list}",

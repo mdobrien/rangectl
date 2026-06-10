@@ -42,6 +42,8 @@ node). `exec` passes through the **remote command's** exit code.
 | `destroy <range>` | connect+destroy; falls back to `cleanup` if not running |
 | `destroy --all` | destroy every range |
 | `cleanup <range>` | force-remove orphaned state |
+| `mgmt-ns status` | read-only invariant check of the persistent `rangectl-mgmt` ns: one OK/MISSING line per item (ns, veths, host addr/route/FORWARD/MASQUERADE/ip_forward, mgmt-ns addr/route/lo/ip_forward) + per-connected-range veth/route. Exit 0 all-OK, 1 anything missing. Never heals — run a deploy or `reset` to heal |
+| `mgmt-ns reset [--force]` | destroy + recreate `rangectl-mgmt`, reconnect running ranges. Refuses without `--force` when ranges run (brief connectivity blip) |
 | `images {list, add <name> <path> [--inject M] [--os-type T], remove <name>, info <name>}` | StateDB image registry |
 
 ## Concurrent multi-range (validated)
@@ -101,7 +103,14 @@ infrastructure — never auto-destroyed (D5). If it is deleted while ranges run,
 the next deploy's `ensure_mgmt_ns()` recreates it and reconnects the running
 ranges. The per-range leak assert is unchanged: deployed ranges still settle to
 `netns == veth == 0` *for their own* namespaces (the one persistent
-`rangectl-mgmt` aside).
+`rangectl-mgmt` aside). `rangectl mgmt-ns status` checks its health;
+`rangectl mgmt-ns reset --force` rebuilds it deliberately.
+
+**Internet is per-range only (D4).** The legacy test-conftest blanket
+MASQUERADE for the whole mgmt pool is retired. A range gets outbound ONLY via
+`internet="full"` at deploy (or runtime `enable_internet()`), which installs a
+`RANGE-<name>` NAT chain inside `rangectl-mgmt`. No chain == no internet —
+tests/scripts that apt-install must opt in.
 
 ## Gotchas
 

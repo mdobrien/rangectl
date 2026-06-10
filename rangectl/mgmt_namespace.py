@@ -162,9 +162,12 @@ def _ip_forward(netns_name: str | None = None) -> bool:
     return r.stdout.strip() == "1"
 
 
-def _iptables_present(args: list[str], netns_name: str | None = None) -> bool:
+def _iptables_present(args: list[str], netns_name: str | None = None,
+                      table: str | None = None) -> bool:
     pre = ["ip", "netns", "exec", netns_name] if netns_name else []
-    return _run([*pre, "iptables", "-C", *args], check=False).returncode == 0
+    tbl = ["-t", table] if table else []
+    return _run([*pre, "iptables", *tbl, "-C", *args],
+                check=False).returncode == 0
 
 
 # --- overlap abort (D3b) --------------------------------------------------
@@ -299,51 +302,61 @@ def ensure_mgmt_ns(transit: str | None = None, pool: str | None = None,
 def _ensure_host_iptables(transit: ipaddress.IPv4Network,
                           uplink: str | None) -> None:
     """The host's static FORWARD + MASQUERADE ops (idempotent)."""
-    fwd = [
+    for rule in _host_forward_rules():
+        if not _iptables_present(["FORWARD", *rule]):
+            _run(["iptables", "-A", "FORWARD", *rule], check=False)
+    if uplink:
+        masq = _host_masquerade_rule(transit, uplink)
+        if not _iptables_present(masq, table="nat"):
+            _run(["iptables", "-t", "nat", "-A", *masq], check=False)
+
+
+def _host_forward_rules() -> list[list[str]]:
+    return [
         ["-i", VETH_HOST, "-j", "ACCEPT"],
         ["-o", VETH_HOST, "-m", "state", "--state",
          "RELATED,ESTABLISHED", "-j", "ACCEPT"],
     ]
-    for rule in fwd:
-        if _run(["iptables", "-C", "FORWARD", *rule], check=False).returncode != 0:
-            _run(["iptables", "-A", "FORWARD", *rule], check=False)
-    if uplink:
-        masq = ["-t", "nat", "POSTROUTING", "-s", str(transit),
-                "-o", uplink, "-j", "MASQUERADE"]
-        if _run(["iptables", *masq[:1], "-C", *masq[1:]], check=False).returncode != 0:
-            _run(["iptables", "-t", "nat", "-A", "POSTROUTING",
-                  "-s", str(transit), "-o", uplink, "-j", "MASQUERADE"],
-                 check=False)
 
 
-def _reconnect_running_ranges(range_dir: str) -> None:
-    """Re-wire every still-running range into a freshly (re)created mgmt-ns.
+def _host_masquerade_rule(transit: ipaddress.IPv4Network,
+                          uplink: str) -> list[str]:
+    return ["POSTROUTING", "-s", str(transit), "-o", uplink, "-j", "MASQUERADE"]
+
+
+def running_ranges(range_dir: str = DEFAULT_RANGE_DIR) -> list[dict]:
+    """Ranges whose own namespace is live: ``[{name, subnet, netns_name}]``.
 
     Source of truth is ``<range_dir>/<name>/range.json`` (host-global, the same
     state ``supervisor.destroy_range`` reads), not the per-user StateDB.
     """
     root = Path(range_dir)
     if not root.is_dir():
-        return
-    for state_file in root.glob("*/range.json"):
+        return []
+    out: list[dict] = []
+    for state_file in sorted(root.glob("*/range.json")):
         try:
             state = json.loads(state_file.read_text())
         except (OSError, json.JSONDecodeError):
             continue
         netns_name = state.get("netns_name")
         subnet = state.get("subnet")
-        if not netns_name or not subnet:
+        if not netns_name or not subnet or not _live_netns(netns_name):
             continue
-        # Only reconnect ranges whose own namespace still exists.
-        if not _live_netns(netns_name):
-            continue
-        name = state_file.parent.name
+        out.append({"name": state_file.parent.name, "subnet": subnet,
+                    "netns_name": netns_name})
+    return out
+
+
+def _reconnect_running_ranges(range_dir: str) -> None:
+    """Re-wire every still-running range into a freshly (re)created mgmt-ns."""
+    for rng in running_ranges(range_dir):
         log.info("ensure_mgmt_ns: reconnecting running range %s (%s)",
-                 name, subnet)
+                 rng["name"], rng["subnet"])
         try:
-            connect_range(name, subnet)
+            connect_range(rng["name"], rng["subnet"])
         except Exception as exc:  # one bad range must not block the rest
-            log.warning("reconnect of range %s failed: %s", name, exc)
+            log.warning("reconnect of range %s failed: %s", rng["name"], exc)
 
 
 # --- per-range connect / disconnect ---------------------------------------
@@ -371,27 +384,41 @@ def disconnect_range(range_name: str, mgmt_subnet: str, veth_host: str,
 
 # --- reset / status -------------------------------------------------------
 
-def destroy_mgmt_ns() -> None:
-    """Delete the mgmt-ns (host route/veth go with it). Reset/tests ONLY — never
-    called automatically (D5)."""
+def destroy_mgmt_ns(transit: str | None = None, pool: str | None = None) -> None:
+    """Delete the mgmt-ns and ALL 4 host static ops (veth, route, FORWARD,
+    MASQUERADE) — symmetric with ``ensure_mgmt_ns``, so a clean-slate host diff
+    starts from zero. Reset/tests ONLY — never called automatically (D5)."""
     log.info("destroy_mgmt_ns: removing %s", MGMT_NS)
     _run(["ip", "netns", "del", MGMT_NS], check=False)
     _run(["ip", "link", "del", VETH_HOST], check=False)
-    aggregate = pool_aggregate()
-    _run(["ip", "route", "del", aggregate], check=False)
+    _run(["ip", "route", "del", pool_aggregate(pool)], check=False)
+    # Loop -D until no copy matches: clears duplicates accumulated by the
+    # pre-16c malformed -C probe (which re-appended the MASQUERADE each ensure).
+    for rule in _host_forward_rules():
+        while _run(["iptables", "-D", "FORWARD", *rule],
+                   check=False).returncode == 0:
+            pass
+    uplink = internet.detect_outbound_iface()
+    if uplink:
+        masq = _host_masquerade_rule(resolve_transit(transit), uplink)
+        while _run(["iptables", "-t", "nat", "-D", *masq],
+                   check=False).returncode == 0:
+            pass
 
 
 def status(transit: str | None = None, pool: str | None = None) -> dict:
     """Read-only snapshot of the invariant (for ``rangectl mgmt-ns status`` and
-    tests). Every value is a bool except the names/subnets."""
+    tests). Every value is a bool except the names/subnets/uplink."""
     transit_net = resolve_transit(transit)
     aggregate = pool_aggregate(pool)
     host_ip, ns_ip, prefix = _transit_ips(transit_net)
     ns_up = _ns_exists()
+    uplink = internet.detect_outbound_iface()
     return {
         "namespace": MGMT_NS,
         "transit": str(transit_net),
         "aggregate": aggregate,
+        "uplink": uplink,
         "ns_exists": ns_up,
         "veth_host_up": _link_up(VETH_HOST),
         "veth_ns_up": _link_up(VETH_NS, MGMT_NS) if ns_up else False,
@@ -399,8 +426,30 @@ def status(transit: str | None = None, pool: str | None = None) -> dict:
         "host_route": _has_route(aggregate),
         "host_forward": _iptables_present(["FORWARD", "-i", VETH_HOST,
                                            "-j", "ACCEPT"]),
+        # No uplink → ensure skips the MASQUERADE, so it is not required.
+        "host_masquerade": _iptables_present(
+            ["POSTROUTING", "-s", str(transit_net), "-o", uplink,
+             "-j", "MASQUERADE"], table="nat") if uplink else True,
         "host_ip_forward": _ip_forward(),
         "ns_addr": _has_addr(VETH_NS, f"{ns_ip}/{prefix}", MGMT_NS) if ns_up else False,
         "ns_default_route": _has_route("default", MGMT_NS) if ns_up else False,
+        "ns_lo_up": _link_up("lo", MGMT_NS) if ns_up else False,
         "ns_ip_forward": _ip_forward(MGMT_NS) if ns_up else False,
     }
+
+
+def connected_ranges(range_dir: str = DEFAULT_RANGE_DIR) -> list[dict]:
+    """Read-only per-range mgmt-ns wiring presence (for ``mgmt-ns status``):
+    ``[{name, subnet, veth, veth_present, route_present}]``."""
+    ns_up = _ns_exists()
+    out: list[dict] = []
+    for rng in running_ranges(range_dir):
+        veth, _ = netns._mgmt_veth_names(rng["name"])
+        out.append({
+            "name": rng["name"],
+            "subnet": rng["subnet"],
+            "veth": veth,
+            "veth_present": _link_exists(veth, MGMT_NS) if ns_up else False,
+            "route_present": _has_route(rng["subnet"], MGMT_NS) if ns_up else False,
+        })
+    return out

@@ -10,7 +10,6 @@ Run on EC2 (KVM + libvirt + root required):
 Every test destroys its range(s); a safety fixture sweeps stray state.
 """
 from __future__ import annotations
-import contextlib
 import logging
 import subprocess
 import time
@@ -23,7 +22,7 @@ from rangectl.cgroup import Resources
 from rangectl.engine import Engine
 from rangectl.libvirt_backend import LibvirtBackend
 from rangectl.state import StateDB
-from tests.integration.conftest import MGMT_SUBNET_CIDR, _primary_iface, pytestmark_skip
+from tests.integration.conftest import pytestmark_skip
 from tests.integration.test_ns_integration import (
     _netns_exists,
     _sweep_ranges,
@@ -39,35 +38,6 @@ pytestmark = pytestmark_skip
 def cleanup_ranges():
     yield
     _sweep_ranges()
-
-
-@contextlib.contextmanager
-def _without_blanket_nat():
-    """Temporarily drop conftest's session-wide MASQUERADE for the default mgmt
-    subnet.
-
-    Every fresh-DB test allocates the first subnet (10.255.1.0/24), which
-    the ``vm_internet_nat`` session fixture NATs unconditionally for legacy
-    tests. That blanket rule would mask the per-range internet policy, so the
-    internet tests remove it for their duration and restore it afterward —
-    leaving ONLY the ``RANGE-<name>`` chain (when internet=full) as the NAT
-    path, which is exactly what we want to exercise.
-    """
-    iface = _primary_iface()
-    check = ["iptables", "-t", "nat", "-C", "POSTROUTING",
-             "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE"]
-    had = subprocess.run(check, capture_output=True).returncode == 0
-    if had:
-        subprocess.run(["iptables", "-t", "nat", "-D", "POSTROUTING",
-                        "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE"],
-                       capture_output=True)
-    try:
-        yield
-    finally:
-        if had:
-            subprocess.run(["iptables", "-t", "nat", "-A", "POSTROUTING",
-                            "-s", MGMT_SUBNET_CIDR, "-o", iface, "-j", "MASQUERADE"],
-                           capture_output=True)
 
 
 def _host_ping(target_ip: str, count: int = 2, wait: int = 2) -> bool:
@@ -323,17 +293,15 @@ def test_ns_internet_none_blocks_outbound(backend: LibvirtBackend, db: StateDB):
     b = t.node("b", image="ubuntu-22.04", vcpu=1, memory=1024)
     t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
-    # Deploy with the blanket NAT in place so cloud-init has internet and the
-    # VM boots quickly/reliably; internet="none" adds no per-range NAT. Only
-    # for the blockage assertion do we drop the blanket rule — then there is NO
-    # NAT for this subnet, so internet=none genuinely blocks outbound.
+    # internet="none" installs no RANGE-<name> NAT chain in the mgmt-ns, so the
+    # VM's 10.255.x source reaches the host un-rewritten and the host's transit
+    # MASQUERADE never matches — no NAT path exists (D4: no blanket NAT either).
     engine = Engine(backend, db, use_namespaces=True)  # internet defaults none
     rng = engine.deploy(t)
     try:
-        with _without_blanket_nat():
-            out = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
-            assert out.exit_code != 0, (
-                f"internet=none should block outbound, but ping succeeded:\n{out.stdout}")
+        out = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
+        assert out.exit_code != 0, (
+            f"internet=none should block outbound, but ping succeeded:\n{out.stdout}")
     finally:
         engine.destroy(t)
 
@@ -344,22 +312,21 @@ def test_ns_internet_full_allows_outbound(backend: LibvirtBackend, db: StateDB):
     b = t.node("b", image="ubuntu-22.04", vcpu=1, memory=1024)
     t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
-    # Drop the blanket NAT so ONLY the per-range RANGE-<name> chain provides
-    # outbound — this proves the feature, not the legacy fixture.
-    with _without_blanket_nat():
-        engine = Engine(backend, db, use_namespaces=True, internet="full")
-        rng = engine.deploy(t)
-        try:
-            ping = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
-            assert ping.exit_code == 0, (
-                f"internet=full should allow outbound ping:\n{ping.stdout}{ping.stderr}")
-            # apt-get update exercises DNS + outbound HTTP through the MASQUERADE.
-            apt = rng["a"].exec(
-                "sudo DEBIAN_FRONTEND=noninteractive apt-get update")
-            assert apt.exit_code == 0, (
-                f"apt-get update failed with internet=full:\n{apt.stdout}\n{apt.stderr}")
-        finally:
-            engine.destroy(t)
+    # ONLY the per-range RANGE-<name> chain (inside the mgmt-ns) provides
+    # outbound — there is no blanket NAT anymore (D4).
+    engine = Engine(backend, db, use_namespaces=True, internet="full")
+    rng = engine.deploy(t)
+    try:
+        ping = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
+        assert ping.exit_code == 0, (
+            f"internet=full should allow outbound ping:\n{ping.stdout}{ping.stderr}")
+        # apt-get update exercises DNS + outbound HTTP through the MASQUERADE.
+        apt = rng["a"].exec(
+            "sudo DEBIAN_FRONTEND=noninteractive apt-get update")
+        assert apt.exit_code == 0, (
+            f"apt-get update failed with internet=full:\n{apt.stdout}\n{apt.stderr}")
+    finally:
+        engine.destroy(t)
 
 
 def test_ns_internet_runtime_toggle(backend: LibvirtBackend, db: StateDB):
@@ -370,31 +337,30 @@ def test_ns_internet_runtime_toggle(backend: LibvirtBackend, db: StateDB):
     b = t.node("b", image="ubuntu-22.04", vcpu=1, memory=1024)
     t.link(a.eth1["10.0.1.1/24"], b.eth1["10.0.1.2/24"])
 
-    # Boot with the blanket NAT present (fast/reliable); then drop it for the
-    # toggle assertions so ONLY the per-range chain controls outbound.
+    # The per-range chain in the mgmt-ns is the ONLY NAT path (no blanket NAT,
+    # D4) — the toggle alone controls outbound.
     engine = Engine(backend, db, use_namespaces=True)
     rng = engine.deploy(t)
     try:
-        with _without_blanket_nat():
-            assert rng["a"].exec("ping -c 2 -W 3 8.8.8.8").exit_code != 0, (
-                "outbound should be blocked before enable_internet()")
+        assert rng["a"].exec("ping -c 2 -W 3 8.8.8.8").exit_code != 0, (
+            "outbound should be blocked before enable_internet()")
 
-            rng.enable_internet()
-            assert rng.internet == "full"
-            opened = None
-            for _ in range(5):
-                opened = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
-                if opened.exit_code == 0:
-                    break
-                time.sleep(2)
-            assert opened.exit_code == 0, (
-                f"enable_internet() did not open outbound:\n{opened.stdout}{opened.stderr}")
+        rng.enable_internet()
+        assert rng.internet == "full"
+        opened = None
+        for _ in range(5):
+            opened = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
+            if opened.exit_code == 0:
+                break
+            time.sleep(2)
+        assert opened.exit_code == 0, (
+            f"enable_internet() did not open outbound:\n{opened.stdout}{opened.stderr}")
 
-            rng.disable_internet()
-            assert rng.internet == "none"
-            closed = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
-            assert closed.exit_code != 0, (
-                f"disable_internet() did not close outbound:\n{closed.stdout}")
+        rng.disable_internet()
+        assert rng.internet == "none"
+        closed = rng["a"].exec("ping -c 2 -W 3 8.8.8.8")
+        assert closed.exit_code != 0, (
+            f"disable_internet() did not close outbound:\n{closed.stdout}")
     finally:
         engine.destroy(t)
 

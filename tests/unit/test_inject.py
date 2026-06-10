@@ -30,10 +30,24 @@ def test_inject_packages(backend, db):
     assert any("apt-get install -y" in c and "nginx" in c and "curl" in c for c in cmds)
 
 
+def test_inject_packages_updates_index_before_install(backend, db):
+    """Cloud images ship a stale baked-in apt index — installing from it 404s
+    on superseded package versions. apt-get update must precede install."""
+    topo = _topo("upd")
+    topo._nodes["a"].packages(["nginx"])
+    Engine(backend, db).deploy(topo)
+
+    cmds = _exec_cmds(backend)
+    update_idx = next(i for i, c in enumerate(cmds) if "apt-get update" in c)
+    install_idx = next(i for i, c in enumerate(cmds) if "apt-get install" in c)
+    assert update_idx < install_idx
+
+
 def test_inject_packages_skipped_when_empty(backend, db):
     Engine(backend, db).deploy(_topo("nopkg"))
     # no packages registered, no apt-get exec
     assert not any("apt-get install" in c for c in _exec_cmds(backend))
+    assert not any("apt-get update" in c for c in _exec_cmds(backend))
 
 
 def test_inject_files(backend, db):

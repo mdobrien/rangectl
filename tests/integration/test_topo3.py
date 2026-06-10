@@ -30,7 +30,9 @@ def _topo3(backend: LibvirtBackend, db: StateDB) -> Topology:
 
 def test_topo3_service_through_router(backend, db):
     topo = _topo3(backend, db)
-    with topo.deploy() as rng:
+    # nginx is apt-installed during deploy — needs the per-range internet
+    # policy now that the legacy blanket NAT is retired (Phase 16, D4).
+    with topo.deploy(internet="full") as rng:
         # Routes for the cross-subnet path.
         rng["attacker"].exec("sudo ip route add 10.0.2.0/24 via 10.0.1.1")
         rng["web"].exec("sudo ip route add 10.0.1.0/24 via 10.0.2.1")

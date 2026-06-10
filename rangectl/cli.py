@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-from rangectl import supervisor
+from rangectl import mgmt_namespace, supervisor
 from rangectl.state import StateDB
 from rangectl.topology import Range
 from rangectl.types import RangeNotRunning
@@ -404,6 +404,75 @@ def cmd_images(args: argparse.Namespace) -> int:
         db.close()
 
 
+# --- management namespace ----------------------------------------------------
+
+# (status() key, human label) — one line per invariant item, in check order.
+_MGMT_STATUS_ITEMS = [
+    ("ns_exists", "namespace"),
+    ("veth_host_up", "host veth up (veth-mgmt-host)"),
+    ("veth_ns_up", "mgmt-ns veth up (veth-mgmt-ns)"),
+    ("host_addr", "host transit address"),
+    ("host_route", "host pool route"),
+    ("host_forward", "host FORWARD accept"),
+    ("host_masquerade", "host transit MASQUERADE"),
+    ("host_ip_forward", "host ip_forward"),
+    ("ns_addr", "mgmt-ns transit address"),
+    ("ns_default_route", "mgmt-ns default route"),
+    ("ns_lo_up", "mgmt-ns loopback up"),
+    ("ns_ip_forward", "mgmt-ns ip_forward"),
+]
+
+
+def cmd_mgmt_ns(args: argparse.Namespace) -> int:
+    if args.mgmt_action == "status":
+        return _mgmt_ns_status()
+    if args.mgmt_action == "reset":
+        return _mgmt_ns_reset(args.force)
+    _err("mgmt-ns requires an action: status or reset")
+    return 1
+
+
+def _mgmt_ns_status() -> int:
+    """Read-only invariant report. Exit 0 only when every item is present."""
+    st = mgmt_namespace.status()
+    ranges = mgmt_namespace.connected_ranges()
+    print(f"mgmt-ns: {st['namespace']}  transit={st['transit']}  "
+          f"pool={st['aggregate']}")
+    all_ok = True
+    for key, label in _MGMT_STATUS_ITEMS:
+        present = bool(st.get(key))
+        all_ok = all_ok and present
+        print(f"  {label:<32} {'OK' if present else 'MISSING'}")
+    if not ranges:
+        print("connected ranges: none")
+    else:
+        print("connected ranges:")
+        for r in ranges:
+            veth_ok = r["veth_present"]
+            route_ok = r["route_present"]
+            all_ok = all_ok and veth_ok and route_ok
+            print(f"  {r['name']:<16} {r['subnet']:<18} "
+                  f"veth {r['veth']} {'OK' if veth_ok else 'MISSING'}  "
+                  f"route {'OK' if route_ok else 'MISSING'}")
+    return 0 if all_ok else 1
+
+
+def _mgmt_ns_reset(force: bool) -> int:
+    """Destroy + recreate the mgmt-ns; ensure reconnects running ranges."""
+    running = mgmt_namespace.running_ranges()
+    if running and not force:
+        names = ", ".join(r["name"] for r in running)
+        _err(f"{len(running)} range(s) running ({names}); reset briefly drops "
+             "their connectivity. Re-run with --force.")
+        return 1
+    mgmt_namespace.destroy_mgmt_ns()
+    mgmt_namespace.ensure_mgmt_ns()
+    print("mgmt-ns rebuilt (namespace, transit veth, host route/FORWARD/NAT).")
+    for r in running:
+        print(f"reconnected: {r['name']} ({r['subnet']})")
+    return 0
+
+
 # --- parser ----------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -521,6 +590,20 @@ def build_parser() -> argparse.ArgumentParser:
     lsub.add_parser("clear", help="remove all impairments")
     lsub.add_parser("status", help="show current impairments")
     p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("mgmt-ns",
+                       help="persistent management namespace operations")
+    msub = p.add_subparsers(dest="mgmt_action")
+    msub.add_parser("status",
+                    help="invariant check, read-only (exit 1 if anything "
+                         "missing)")
+    mp = msub.add_parser("reset",
+                         help="destroy + recreate the mgmt-ns and reconnect "
+                              "running ranges")
+    mp.add_argument("--force", action="store_true",
+                    help="proceed even when ranges are running (brief "
+                         "connectivity blip)")
+    p.set_defaults(func=cmd_mgmt_ns)
 
     p = sub.add_parser("images", help="manage registered images")
     isub = p.add_subparsers(dest="images_action")

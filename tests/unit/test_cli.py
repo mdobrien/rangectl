@@ -397,3 +397,140 @@ def test_images_remove(monkeypatch):
     monkeypatch.setattr(cli, "StateDB", lambda *a, **k: db)
     assert _run(["images", "remove", "kali"]) == 0
     assert "kali" not in db.images
+
+
+# --- mgmt-ns (Phase 16c) -----------------------------------------------------
+
+def _full_status(**overrides):
+    st = {
+        "namespace": "rangectl-mgmt",
+        "transit": "10.254.0.0/30",
+        "aggregate": "10.255.0.0/16",
+        "uplink": "eth0",
+        "ns_exists": True,
+        "veth_host_up": True,
+        "veth_ns_up": True,
+        "host_addr": True,
+        "host_route": True,
+        "host_forward": True,
+        "host_masquerade": True,
+        "host_ip_forward": True,
+        "ns_addr": True,
+        "ns_default_route": True,
+        "ns_lo_up": True,
+        "ns_ip_forward": True,
+    }
+    st.update(overrides)
+    return st
+
+
+def _connected(name="lab", subnet="10.255.1.0/24", veth="mghdeadbeef",
+               veth_present=True, route_present=True):
+    return {"name": name, "subnet": subnet, "veth": veth,
+            "veth_present": veth_present, "route_present": route_present}
+
+
+def test_mgmt_ns_status_parses():
+    parser = cli.build_parser()
+    args = parser.parse_args(["mgmt-ns", "status"])
+    assert args.func is cli.cmd_mgmt_ns
+    assert args.mgmt_action == "status"
+
+
+def test_mgmt_ns_reset_parses_force():
+    parser = cli.build_parser()
+    args = parser.parse_args(["mgmt-ns", "reset", "--force"])
+    assert args.mgmt_action == "reset"
+    assert args.force is True
+    args = parser.parse_args(["mgmt-ns", "reset"])
+    assert args.force is False
+
+
+def test_mgmt_ns_no_action_errors(capsys):
+    assert _run(["mgmt-ns"]) == 1
+
+
+def test_mgmt_ns_status_all_ok_exit0(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "status", lambda: _full_status())
+    monkeypatch.setattr(cli.mgmt_namespace, "connected_ranges",
+                        lambda: [_connected()])
+    assert _run(["mgmt-ns", "status"]) == 0
+    out = capsys.readouterr().out
+    assert "MISSING" not in out
+    # One OK line per invariant item + the connected range's veth/route.
+    assert out.count("OK") >= 14
+    assert "lab" in out and "10.255.1.0/24" in out and "mghdeadbeef" in out
+
+
+def test_mgmt_ns_status_missing_item_named_exit1(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "status",
+                        lambda: _full_status(host_route=False))
+    monkeypatch.setattr(cli.mgmt_namespace, "connected_ranges", lambda: [])
+    assert _run(["mgmt-ns", "status"]) == 1
+    out = capsys.readouterr().out
+    missing = [ln for ln in out.splitlines() if "MISSING" in ln]
+    assert len(missing) == 1
+    assert "host pool route" in missing[0]
+
+
+def test_mgmt_ns_status_missing_range_route_exit1(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "status", lambda: _full_status())
+    monkeypatch.setattr(cli.mgmt_namespace, "connected_ranges",
+                        lambda: [_connected(route_present=False)])
+    assert _run(["mgmt-ns", "status"]) == 1
+    out = capsys.readouterr().out
+    assert "MISSING" in out and "lab" in out
+
+
+def test_mgmt_ns_status_is_read_only(monkeypatch):
+    """status must never heal — no ensure/destroy calls."""
+    called = []
+    monkeypatch.setattr(cli.mgmt_namespace, "ensure_mgmt_ns",
+                        lambda *a, **k: called.append("ensure"))
+    monkeypatch.setattr(cli.mgmt_namespace, "destroy_mgmt_ns",
+                        lambda *a, **k: called.append("destroy"))
+    monkeypatch.setattr(cli.mgmt_namespace, "status", lambda: _full_status())
+    monkeypatch.setattr(cli.mgmt_namespace, "connected_ranges", lambda: [])
+    _run(["mgmt-ns", "status"])
+    assert called == []
+
+
+def test_mgmt_ns_reset_blocked_without_force(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "running_ranges",
+                        lambda: [{"name": "lab", "subnet": "10.255.1.0/24",
+                                  "netns_name": "rangectl-lab"}])
+    called = []
+    monkeypatch.setattr(cli.mgmt_namespace, "destroy_mgmt_ns",
+                        lambda: called.append("destroy"))
+    monkeypatch.setattr(cli.mgmt_namespace, "ensure_mgmt_ns",
+                        lambda *a, **k: called.append("ensure"))
+    assert _run(["mgmt-ns", "reset"]) == 1
+    assert called == []
+    err = capsys.readouterr().err
+    assert "--force" in err and "lab" in err
+
+
+def test_mgmt_ns_reset_force_destroys_then_ensures(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "running_ranges",
+                        lambda: [{"name": "lab", "subnet": "10.255.1.0/24",
+                                  "netns_name": "rangectl-lab"}])
+    called = []
+    monkeypatch.setattr(cli.mgmt_namespace, "destroy_mgmt_ns",
+                        lambda: called.append("destroy"))
+    monkeypatch.setattr(cli.mgmt_namespace, "ensure_mgmt_ns",
+                        lambda *a, **k: called.append("ensure"))
+    assert _run(["mgmt-ns", "reset", "--force"]) == 0
+    assert called == ["destroy", "ensure"]
+    out = capsys.readouterr().out
+    assert "lab" in out  # reports the reconnected range
+
+
+def test_mgmt_ns_reset_no_ranges_needs_no_force(monkeypatch, capsys):
+    monkeypatch.setattr(cli.mgmt_namespace, "running_ranges", lambda: [])
+    called = []
+    monkeypatch.setattr(cli.mgmt_namespace, "destroy_mgmt_ns",
+                        lambda: called.append("destroy"))
+    monkeypatch.setattr(cli.mgmt_namespace, "ensure_mgmt_ns",
+                        lambda *a, **k: called.append("ensure"))
+    assert _run(["mgmt-ns", "reset"]) == 0
+    assert called == ["destroy", "ensure"]

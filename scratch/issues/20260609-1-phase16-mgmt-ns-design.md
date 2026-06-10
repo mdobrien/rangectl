@@ -1,6 +1,6 @@
 # Design: Phase 16 Management Namespace — Options & Recommendation
 **Created**: 2026-06-09
-**Status**: In Progress
+**Status**: Complete
 
 ## Related Issues
 - **Parent**: `20260603-1-phase16-management-namespace.md` — Phase 16 spec (links back here)
@@ -130,5 +130,7 @@ Suggested split for coding agents (each one context window):
 
 - 2026-06-09: **16b DONE** — new `rangectl/mgmt_namespace.py` (`ensure_mgmt_ns` verify-and-heal + flock + D3b overlap abort + heal-reconnect from `/ranges/*/range.json`; `connect_range`/`disconnect_range`/`destroy_mgmt_ns`/`status`; `RANGECTL_MGMT_TRANSIT`). Rewired `netns.py` (per-range `mgh<hash>` + gateway + FORWARD/isolation now inside `rangectl-mgmt`), `internet.py` (`netns=` param → `RANGE-<name>` chain in mgmt-ns), engine/supervisor/topology call sites. **H5 fixed**: teardown always disables internet (`destroy_range`→`disconnect_range`, idempotent). Orphan sweeps exclude `rangectl-mgmt`. **Egress NAT**: host static MASQUERADE is `-s <transit /30>` (not the aggregate); `full` ranges MASQUERADE to the transit in the mgmt-ns and the host re-NATs, `none` ranges have no chain so the transit MASQUERADE never matches — free gating. Gate 1: 358 unit, 0 skips. Gate 2 (EC2): smoke a–d + `test_ns_two_node` + internet none/full/toggle all green. See `20260603-1` progress log for full detail. 16c (CLI + broad suite) remains.
 
+- 2026-06-10: **16c DONE** — `rangectl mgmt-ns status` (read-only OK/MISSING per invariant item + connected ranges, exit 0/1) and `mgmt-ns reset [--force]` (destroy→ensure, gated on running ranges). Blanket conftest NAT retired per D4 (`vm_internet_nat`/`MGMT_SUBNET_CIDR`/`_without_blanket_nat` deleted; `test_topo3` → `internet="full"`; no legacy-mode test needed a scoped fallback). New `test_mgmt_ns_cli.py` (2-range sharing + host-clean, status exit codes + heal, reset --force live-range). Two bugs fixed: malformed `iptables -t -C` MASQUERADE probe duplicating the host transit rule every ensure (destroy now removes all 4 static ops, looping -D to clear dupes), and engine `apt-get install` without prior `apt-get update` (stale baked image index → 404). Gate 1 378/0-skip; Gate 2 all green. See `20260603-1` for full evidence.
+
 ## Resolution
-16a + 16b complete — see progress entries. Pool is 10.255.0.0/16; transit `10.254.0.0/30` (`RANGECTL_MGMT_TRANSIT`). Persistent `rangectl-mgmt` interposed; host carries only the 4 static ops. 16c remains: `rangectl mgmt-ns status/reset` CLI + broad integration-suite migration (retire conftest blanket NAT per D4).
+Phase 16 complete (16a+16b+16c). Pool 10.255.0.0/16; transit `10.254.0.0/30` (`RANGECTL_MGMT_TRANSIT`). Persistent `rangectl-mgmt` interposed; host carries only the 4 static ops, verified by `rangectl mgmt-ns status` and rebuilt by `mgmt-ns reset --force`. Per-range internet policy is the only NAT path (D4 — blanket test NAT gone).
