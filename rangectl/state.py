@@ -89,6 +89,30 @@ CREATE TABLE IF NOT EXISTS images (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Phase 21 (D5-B): captures/mirrors rows store INTENT and act as an index.
+-- All status queries read live kernel/process state, never these rows.
+CREATE TABLE IF NOT EXISTS captures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topology_name TEXT NOT NULL,
+    node_name TEXT,
+    iface TEXT,
+    device TEXT,
+    file TEXT,
+    pid INTEGER,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS mirrors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    topology_name TEXT NOT NULL,
+    src_node TEXT NOT NULL,
+    src_iface TEXT NOT NULL,
+    dst_node TEXT NOT NULL,
+    dst_iface TEXT NOT NULL,
+    direction TEXT NOT NULL,
+    UNIQUE(topology_name, src_node, src_iface)
+);
+
 CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     topology_name TEXT NOT NULL,
@@ -271,6 +295,81 @@ class StateDB:
             cur = self._conn.execute("SELECT * FROM topologies ORDER BY name")
             return [_row_to_dict(cur, row) for row in cur.fetchall()]
 
+    # --- captures & mirrors (Phase 21, D5-B: intent/index only) ------------
+
+    def add_capture(self, topology_name: str, node_name: str | None,
+                    iface: str | None, device: str | None) -> int:
+        log.info("Adding capture row for %s/%s/%s", topology_name, node_name, iface)
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO captures (topology_name, node_name, iface, device) "
+                "VALUES (?, ?, ?, ?)",
+                (topology_name, node_name, iface, device),
+            )
+            self._conn.commit()
+            return cur.lastrowid
+
+    def update_capture(self, capture_id: int, file: str, pid: int) -> None:
+        log.info("Updating capture %d: file=%s pid=%d", capture_id, file, pid)
+        with self._lock:
+            self._conn.execute(
+                "UPDATE captures SET file=?, pid=? WHERE id=?",
+                (file, pid, capture_id),
+            )
+            self._conn.commit()
+
+    def get_capture(self, topology_name: str, capture_id: int) -> dict | None:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM captures WHERE topology_name=? AND id=?",
+                (topology_name, capture_id),
+            )
+            row = cur.fetchone()
+            return _row_to_dict(cur, row) if row else None
+
+    def list_captures(self, topology_name: str) -> list[dict]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM captures WHERE topology_name=? ORDER BY id ASC",
+                (topology_name,),
+            )
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
+    def save_mirror(self, topology_name: str, src_node: str, src_iface: str,
+                    dst_node: str, dst_iface: str, direction: str) -> None:
+        log.info("Saving mirror intent %s: %s/%s -> %s/%s (%s)",
+                 topology_name, src_node, src_iface, dst_node, dst_iface,
+                 direction)
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO mirrors (topology_name, src_node, "
+                "src_iface, dst_node, dst_iface, direction) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (topology_name, src_node, src_iface, dst_node, dst_iface,
+                 direction),
+            )
+            self._conn.commit()
+
+    def delete_mirror(self, topology_name: str, src_node: str,
+                      src_iface: str) -> None:
+        log.info("Deleting mirror intent %s: %s/%s", topology_name, src_node,
+                 src_iface)
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM mirrors WHERE topology_name=? AND src_node=? "
+                "AND src_iface=?",
+                (topology_name, src_node, src_iface),
+            )
+            self._conn.commit()
+
+    def list_mirrors(self, topology_name: str) -> list[dict]:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM mirrors WHERE topology_name=? ORDER BY id ASC",
+                (topology_name,),
+            )
+            return [_row_to_dict(cur, row) for row in cur.fetchall()]
+
     def delete_topology(self, name: str) -> None:
         log.info("Deleting topology '%s' from DB", name)
         with self._lock:
@@ -278,6 +377,8 @@ class StateDB:
             self._conn.execute("DELETE FROM bridges WHERE topology_name=?", (name,))
             self._conn.execute("DELETE FROM links WHERE topology_name=?", (name,))
             self._conn.execute("DELETE FROM snapshots WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM captures WHERE topology_name=?", (name,))
+            self._conn.execute("DELETE FROM mirrors WHERE topology_name=?", (name,))
             self._conn.execute("DELETE FROM mgmt_subnets WHERE topology_name=?", (name,))
             self._conn.execute("DELETE FROM topologies WHERE name=?", (name,))
             self._conn.commit()

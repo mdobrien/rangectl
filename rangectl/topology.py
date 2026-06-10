@@ -445,6 +445,45 @@ class LinkEndpoint:
         return None
 
 
+def find_link_endpoint(topology: Topology, node_name: str,
+                       iface_name: str) -> tuple["Link", LinkEndpoint]:
+    """Locate the (link, endpoint) for a node's interface. All Phase 21
+    capture/mirror device resolution goes through the returned LinkEndpoint
+    (Phase 20) — never a second MAC->TAP lookup path."""
+    if node_name not in topology._nodes:
+        raise ValueError(
+            f"no node {node_name!r} in range '{topology.name}'")
+    linked: list[str] = []
+    for link in topology._links:
+        for spec, ep in zip((link.if_a, link.if_b), link._endpoints):
+            if spec.node_name != node_name:
+                continue
+            if spec.interface_name == iface_name:
+                return link, ep
+            linked.append(spec.interface_name)
+    raise ValueError(
+        f"{node_name} has no linked interface {iface_name!r}; "
+        f"linked interfaces: {', '.join(sorted(linked)) or 'none'}")
+
+
+def _endpoint_device(topology: Topology, backend: Any, node_name: str,
+                     iface_name: str) -> str:
+    """tc-able device for a node interface. The L2 side of a VM<->L2 link has
+    no device of its own — the VM's TAP IS the switch port, so fall back to
+    the other endpoint of the same link."""
+    link, ep = find_link_endpoint(topology, node_name, iface_name)
+    dev = ep.resolve(backend)
+    if dev is None and ep.is_l2 and len(link._endpoints) == 2:
+        other = (link._endpoints[1] if link._endpoints[0] is ep
+                 else link._endpoints[0])
+        dev = other.resolve(backend)
+    if not dev:
+        raise RuntimeError(
+            f"no device found for {node_name}/{iface_name} "
+            "(VM not running or TAP missing)")
+    return dev
+
+
 class Link:
 
     def __init__(self, if_a: InterfaceSpec, if_b: InterfaceSpec, topology: Topology) -> None:
@@ -470,6 +509,9 @@ class Link:
         # Impairments declared at definition time (Topology.link kwargs),
         # applied once by the engine after the link is wired during deploy.
         self._default_impairments: dict = {}
+        # Mirror intent keyed by (src node, src iface) for endpoints on this
+        # link — re-applied after up() like impairments (Phase 21, D5-B).
+        self._mirrors: dict[tuple[str, str], dict] = {}
 
     def down(self) -> None:
         log.info("Link down: %s/%s <-> %s/%s",
@@ -532,8 +574,9 @@ class Link:
                 self._backend.set_port_vlans(dev, **ep.vlan)
         self._is_up = True
         # Recreating the bridge reset the TAPs to clean qdiscs — restore any
-        # impairments that were in effect before the link went down.
+        # impairments and mirrors that were in effect before the link went down.
         self._reapply_impairments()
+        self._reapply_mirrors()
         if self._db is not None and self._topology_name is not None:
             self._db.log_event(self._topology_name, None, "info",
                                f"link up: {self._bridge_name or self._veth_pair[0]}")
@@ -627,6 +670,29 @@ class Link:
             dev = ep.resolve(self._backend)
             if dev:
                 cmds += build_netem_cmds(dev, netns, **params)
+        if cmds:
+            self._backend.run_tc(cmds)
+
+    def _reapply_mirrors(self) -> None:
+        """Restore mirror intent after up() recreated the TAPs (Phase 21)."""
+        if not self._mirrors or self.topology is None:
+            return
+        from rangectl.mirror import build_mirror_cmds
+        netns = getattr(self._backend, "_netns_name", None)
+        cmds: list[list[str]] = []
+        for (node_name, iface), intent in self._mirrors.items():
+            try:
+                src_dev = _endpoint_device(self.topology, self._backend,
+                                           node_name, iface)
+                dst_dev = _endpoint_device(self.topology, self._backend,
+                                           intent["dst_node"],
+                                           intent["dst_iface"])
+            except (ValueError, RuntimeError) as exc:
+                log.warning("mirror %s/%s not re-applied: %s",
+                            node_name, iface, exc)
+                continue
+            cmds += build_mirror_cmds(src_dev, dst_dev, intent["direction"],
+                                      netns)
         if cmds:
             self._backend.run_tc(cmds)
 
@@ -1027,6 +1093,19 @@ class Range:
                             vlan=other_vlan if other.is_l2 else None))
             topology._links.append(link)
 
+        # Rebuild mirror intent (Phase 21, D5-B) so unmirror and the up()
+        # re-apply work cross-process.
+        for m in db.list_mirrors(name):
+            for link in topology._links:
+                for spec in (link.if_a, link.if_b):
+                    if (spec.node_name == m["src_node"]
+                            and spec.interface_name == m["src_iface"]):
+                        link._mirrors[(m["src_node"], m["src_iface"])] = {
+                            "dst_node": m["dst_node"],
+                            "dst_iface": m["dst_iface"],
+                            "direction": m["direction"],
+                        }
+
         log.info("Reconnected to range '%s' (%d nodes, %d links)",
                  name, len(node_rows), len(topology._links))
         return rng
@@ -1185,6 +1264,173 @@ class Range:
         self.internet = "none"
         if self._db is not None:
             self._db.log_event(self.topology.name, None, "info", "internet disabled")
+
+    # --- packet capture & port mirroring (Phase 21) ------------------------
+
+    def _range_pid(self) -> int | None:
+        """Host PID of the range's unshare wrapper (libvirtd's parent), from
+        the engine's RangeInfo — the nsenter target is resolved from it."""
+        if self._engine is not None:
+            info = self._engine._range_info.get(self.topology.name)
+            if info is not None:
+                return info.pid
+        return None
+
+    def capture(self, node: Any = None, iface: str | None = None, *,
+                filter: str | None = None, output: str | None = None,
+                bridge: str | None = None) -> "Capture":
+        """Start a tcpdump capture inside the range's namespaces (D2-B).
+
+        ``capture(node, iface)`` captures on the interface's host-side device
+        (a VM's TAP: pre-guest egress / post-guest ingress, not the guest
+        view). ``capture(l2node)`` captures on the switch/hub bridge device —
+        all forwarded segment frames. ``bridge=`` is the escape hatch for
+        internal ``data-<i>`` link bridges. The kernel reaps the capture with
+        the range; destroy needs no capture cleanup.
+        """
+        from rangectl.capture import Capture
+        if self._db is None or self._backend is None:
+            raise RuntimeError("capture requires a deployed/connected range")
+        node_name = node if (node is None or isinstance(node, str)) else node.name
+        if bridge is not None:
+            dev = bridge
+        else:
+            if node_name is None:
+                raise ValueError("capture() needs a node (or bridge=)")
+            topo_node = self.topology._nodes.get(node_name)
+            if topo_node is None:
+                raise ValueError(
+                    f"no node {node_name!r} in range '{self.topology.name}'")
+            if iface is None:
+                if not topo_node.is_l2:
+                    raise ValueError(
+                        f"node '{node_name}' is not an L2 device — specify "
+                        "the interface to capture on (e.g. 'eth1')")
+                dev = topo_node.bridge_name
+            else:
+                dev = _endpoint_device(self.topology, self._backend,
+                                       node_name, iface)
+        cap_id = self._db.add_capture(self.topology.name, node_name, iface, dev)
+        file = output or str(
+            Path(supervisor.DEFAULT_RANGE_DIR) / self.topology.name
+            / "captures" / f"cap-{cap_id}.pcap")
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        log.info("[%s] capture %d: dev=%s file=%s filter=%s",
+                 self.topology.name, cap_id, dev, file, filter)
+        proc, pid = self._backend.spawn_capture(self._range_pid(), dev, file,
+                                                bpf=filter)
+        self._db.update_capture(cap_id, file, pid)
+        self._db.log_event(self.topology.name, node_name, "info",
+                           f"capture {cap_id} started on {dev} -> {file}")
+        return Capture(id=cap_id, file=file, pid=pid, node=node_name,
+                       iface=iface, device=dev, proc=proc)
+
+    def stop_capture(self, capture_id: int) -> "Capture":
+        """Stop a capture by id (cross-process: rebuilds the handle from the
+        DB index and signals the recorded host PID)."""
+        from rangectl.capture import Capture
+        row = self._db.get_capture(self.topology.name, capture_id) \
+            if self._db is not None else None
+        if row is None or row["pid"] is None:
+            raise ValueError(
+                f"no capture {capture_id} in range '{self.topology.name}'")
+        cap = Capture(id=row["id"], file=row["file"], pid=row["pid"],
+                      node=row["node_name"], iface=row["iface"],
+                      device=row["device"])
+        cap.stop()
+        self._db.log_event(self.topology.name, row["node_name"], "info",
+                           f"capture {capture_id} stopped")
+        return cap
+
+    def captures(self) -> list[dict]:
+        """Capture index with LIVE status (D5-B): process liveness and file
+        existence are read from the kernel/filesystem, never the DB."""
+        from rangectl import capture as capture_mod
+        out = []
+        for row in self._db.list_captures(self.topology.name):
+            running = (row["pid"] is not None
+                       and capture_mod._pid_alive(row["pid"]))
+            out.append({**row,
+                        "status": "running" if running else "stopped",
+                        "file_exists": bool(row["file"])
+                        and Path(row["file"]).exists()})
+        return out
+
+    def mirror(self, src_node: Any, src_iface: str, *, to: Any, port: str,
+               direction: str = "both") -> None:
+        """Copy ``src_node/src_iface`` traffic to the sensor's interface via
+        clsact + matchall + mirred (D4). Coexists with netem impairments on
+        the same device; mirrored frames mix with the sensor's own traffic
+        (filter with BPF on the sensor). Re-applied after ``link.up()``.
+        """
+        from rangectl.mirror import VALID_DIRECTIONS, build_mirror_cmds
+        if direction not in VALID_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {VALID_DIRECTIONS}, "
+                f"got {direction!r}")
+        src_name = src_node if isinstance(src_node, str) else src_node.name
+        dst_name = to if isinstance(to, str) else to.name
+        src_link, _ = find_link_endpoint(self.topology, src_name, src_iface)
+        src_dev = _endpoint_device(self.topology, self._backend,
+                                   src_name, src_iface)
+        dst_link, dst_ep = find_link_endpoint(self.topology, dst_name, port)
+        dst_dev = dst_ep.resolve(self._backend)
+        if dst_dev is None:
+            raise ValueError(
+                f"cannot mirror to {dst_name}/{port}: an L2 node's bridge is "
+                "not a mirror destination (this port's device is the attached "
+                "VM's TAP) — mirror to the attached node's interface instead")
+        netns = getattr(self._backend, "_netns_name", None)
+        log.info("[%s] mirror %s/%s -> %s/%s (%s): %s -> %s",
+                 self.topology.name, src_name, src_iface, dst_name, port,
+                 direction, src_dev, dst_dev)
+        self._backend.run_tc(build_mirror_cmds(src_dev, dst_dev, direction,
+                                               netns))
+        src_link._mirrors[(src_name, src_iface)] = {
+            "dst_node": dst_name, "dst_iface": port, "direction": direction}
+        if self._db is not None:
+            self._db.save_mirror(self.topology.name, src_name, src_iface,
+                                 dst_name, port, direction)
+            self._db.log_event(self.topology.name, src_name, "info",
+                               f"mirror {src_name}/{src_iface} -> "
+                               f"{dst_name}/{port} ({direction})")
+
+    def unmirror(self, src_node: Any, src_iface: str) -> None:
+        """Remove the mirror on ``src_node/src_iface`` (drops the clsact
+        qdisc and with it every mirror filter)."""
+        from rangectl.mirror import build_unmirror_cmds
+        src_name = src_node if isinstance(src_node, str) else src_node.name
+        src_link, _ = find_link_endpoint(self.topology, src_name, src_iface)
+        src_dev = _endpoint_device(self.topology, self._backend,
+                                   src_name, src_iface)
+        netns = getattr(self._backend, "_netns_name", None)
+        log.info("[%s] unmirror %s/%s (%s)", self.topology.name, src_name,
+                 src_iface, src_dev)
+        self._backend.run_tc(build_unmirror_cmds(src_dev, netns))
+        src_link._mirrors.pop((src_name, src_iface), None)
+        if self._db is not None:
+            self._db.delete_mirror(self.topology.name, src_name, src_iface)
+            self._db.log_event(self.topology.name, src_name, "info",
+                               f"unmirror {src_name}/{src_iface}")
+
+    def mirrors(self) -> list[dict]:
+        """Mirror intents with LIVE status (D5-B): ``active`` is read from
+        ``tc filter show`` on the source device, never the DB."""
+        from rangectl.mirror import _hooks
+        out = []
+        for row in self._db.list_mirrors(self.topology.name):
+            active = False
+            try:
+                src_dev = _endpoint_device(self.topology, self._backend,
+                                           row["src_node"], row["src_iface"])
+                active = all(
+                    "mirred" in self._backend.tc_filter_show(src_dev, hook)
+                    for hook in _hooks(row["direction"]))
+            except (ValueError, RuntimeError) as exc:
+                log.warning("mirror status for %s/%s unavailable: %s",
+                            row["src_node"], row["src_iface"], exc)
+            out.append({**row, "active": active})
+        return out
 
 
 class LiveNode:

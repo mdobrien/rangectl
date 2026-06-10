@@ -42,6 +42,12 @@ node). `exec` passes through the **remote command's** exit code.
 | `destroy <range>` | connect+destroy; falls back to `cleanup` if not running |
 | `destroy --all` | destroy every range |
 | `cleanup <range>` | force-remove orphaned state |
+| `capture <range> <node> [iface] [--filter BPF] [--output P]` | start tcpdump inside the range's namespaces (Phase 21). VM node: `iface` required, captures its host-side TAP. Switch/hub node: omit `iface`, captures the bridge (whole segment). Default pcap: `/ranges/<range>/captures/cap-<id>.pcap` (host-visible; persists until range destroy). Process dies with the range (PID-ns reap) |
+| `capture-stop <range> <id>` | SIGTERM → 5s grace → SIGKILL (prints "possibly truncated" on KILL). Cross-process: PID from the DB index |
+| `captures <range>` | capture index with LIVE status (process liveness + file existence, never DB state) |
+| `mirror <range> <src-node> <src-iface> <dst-node> <dst-iface> [--direction ingress\|egress\|both]` | clsact+matchall+mirred copy of the source port's traffic to the sensor's interface (Phase 21). Coexists with `link ... impair` on the same TAP. Works on switch ports (`<sw> portN` = the enslaved TAP/veth). Re-applied after `link` down/up from stored intent. Dest must be a device-backed port (a VM iface or L2↔L2 veth port) — an L2 node's bridge is rejected |
+| `unmirror <range> <src-node> <src-iface>` | drop the clsact qdisc (removes all mirror filters) |
+| `mirrors <range>` | mirror intents with LIVE `active` read from `tc filter show` |
 | `mgmt-ns status` | read-only invariant check of the persistent `rangectl-mgmt` ns: one OK/MISSING line per item (ns, veths, host addr/route/FORWARD/MASQUERADE/ip_forward, mgmt-ns addr/route/lo/ip_forward) + per-connected-range veth/route. Exit 0 all-OK, 1 anything missing. Never heals — run a deploy or `reset` to heal |
 | `mgmt-ns reset [--force]` | destroy + recreate `rangectl-mgmt`, reconnect running ranges. Refuses without `--force` when ranges run (brief connectivity blip) |
 | `images {list, add <name> <path> [--inject M] [--os-type T], remove <name>, info <name>}` | StateDB image registry |

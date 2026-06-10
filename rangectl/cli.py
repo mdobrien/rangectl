@@ -397,6 +397,67 @@ def cmd_link(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- capture & mirror (Phase 21) ---------------------------------------------
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    cap = rng.capture(args.node, args.iface, filter=args.filter,
+                      output=args.output)
+    print(f"Capture {cap.id} started on {cap.device}: {cap.file}")
+    return 0
+
+
+def cmd_capture_stop(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    cap = rng.stop_capture(args.id)
+    note = " (possibly truncated)" if cap.possibly_truncated else ""
+    print(f"Capture {cap.id} stopped: {cap.file}{note}")
+    return 0
+
+
+def cmd_captures(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    caps = rng.captures()
+    if not caps:
+        print("No captures.")
+        return 0
+    rows = [[c["id"], c["node_name"] or "-", c["iface"] or "-",
+             c["device"] or "-", c["status"],
+             (c["file"] or "-") + ("" if c["file_exists"] else " (missing)")]
+            for c in caps]
+    _print_table(["ID", "NODE", "IFACE", "DEVICE", "STATUS", "FILE"], rows)
+    return 0
+
+
+def cmd_mirror(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    rng.mirror(args.src_node, args.src_iface, to=args.dst_node,
+               port=args.dst_iface, direction=args.direction)
+    print(f"Mirroring {args.src_node}/{args.src_iface} -> "
+          f"{args.dst_node}/{args.dst_iface} ({args.direction})")
+    return 0
+
+
+def cmd_unmirror(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    rng.unmirror(args.src_node, args.src_iface)
+    print(f"Unmirrored {args.src_node}/{args.src_iface}")
+    return 0
+
+
+def cmd_mirrors(args: argparse.Namespace) -> int:
+    rng = Range.connect(args.range)
+    mirrors = rng.mirrors()
+    if not mirrors:
+        print("No mirrors.")
+        return 0
+    rows = [[f"{m['src_node']}/{m['src_iface']}",
+             f"{m['dst_node']}/{m['dst_iface']}", m["direction"],
+             "yes" if m["active"] else "NO"] for m in mirrors]
+    _print_table(["SOURCE", "DEST", "DIRECTION", "ACTIVE"], rows)
+    return 0
+
+
 def cmd_destroy(args: argparse.Namespace) -> int:
     if args.all:
         ranges = Range.list()
@@ -659,6 +720,45 @@ def build_parser() -> argparse.ArgumentParser:
     lsub.add_parser("clear", help="remove all impairments")
     lsub.add_parser("status", help="show current impairments")
     p.set_defaults(func=cmd_link)
+
+    p = sub.add_parser("capture", help="start a tcpdump capture in a range")
+    p.add_argument("range")
+    p.add_argument("node")
+    p.add_argument("iface", nargs="?",
+                   help="interface (omit for switch/hub: captures the bridge)")
+    p.add_argument("--filter", help='BPF filter, e.g. "tcp port 80"')
+    p.add_argument("--output", help="pcap path (default: "
+                                    "/ranges/<range>/captures/cap-<id>.pcap)")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("capture-stop", help="stop a running capture")
+    p.add_argument("range")
+    p.add_argument("id", type=int)
+    p.set_defaults(func=cmd_capture_stop)
+
+    p = sub.add_parser("captures", help="list captures (live status)")
+    p.add_argument("range")
+    p.set_defaults(func=cmd_captures)
+
+    p = sub.add_parser("mirror", help="mirror a port's traffic to a sensor")
+    p.add_argument("range")
+    p.add_argument("src_node")
+    p.add_argument("src_iface")
+    p.add_argument("dst_node")
+    p.add_argument("dst_iface")
+    p.add_argument("--direction", choices=["ingress", "egress", "both"],
+                   default="both")
+    p.set_defaults(func=cmd_mirror)
+
+    p = sub.add_parser("unmirror", help="remove a port mirror")
+    p.add_argument("range")
+    p.add_argument("src_node")
+    p.add_argument("src_iface")
+    p.set_defaults(func=cmd_unmirror)
+
+    p = sub.add_parser("mirrors", help="list mirrors (live status)")
+    p.add_argument("range")
+    p.set_defaults(func=cmd_mirrors)
 
     p = sub.add_parser("mgmt-ns",
                        help="persistent management namespace operations")

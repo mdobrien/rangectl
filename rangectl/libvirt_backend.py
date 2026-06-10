@@ -624,6 +624,45 @@ class LibvirtBackend:
                 log.warning("tc command failed (%d): %s\n%s",
                             res.returncode, " ".join(cmd), res.stderr)
 
+    def tc_filter_show(self, dev: str, hook: str) -> str:
+        """Live tc filter state on a device hook (mirror status, D5-B)."""
+        res = _run(self._ip("tc", "filter", "show", "dev", dev, hook),
+                   check=False)
+        return res.stdout
+
+    def spawn_capture(self, range_pid: int | None, dev: str, output: str,
+                      bpf: str | None = None) -> tuple[subprocess.Popen, int]:
+        """Spawn tcpdump inside the range's net+PID+mount namespaces (D2-B).
+
+        ``range_pid`` is the unshare wrapper recorded in range.json; its only
+        child is libvirtd — PID 1 of the range's PID namespace and the nsenter
+        target. Returns (nsenter proc, tcpdump's host-visible PID): nsenter -p
+        forks, so its child is the actual tcpdump that stop() must signal.
+        """
+        from rangectl.capture import build_capture_cmd, wait_for_child
+        from rangectl.supervisor import _child_pids
+        if range_pid is None:
+            raise RuntimeError(
+                "capture requires a namespace-mode range (no range PID)")
+        children = _child_pids(range_pid)
+        if not children:
+            raise RuntimeError(
+                f"libvirtd not found under range pid {range_pid}; "
+                "is the range running?")
+        cmd = build_capture_cmd(children[0], dev, output, bpf=bpf)
+        log.info("spawn_capture: %s", " ".join(cmd))
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            pid = wait_for_child(proc.pid)
+        except RuntimeError:
+            err = ""
+            if proc.poll() is not None and proc.stderr is not None:
+                err = (proc.stderr.read() or "").strip()
+            raise RuntimeError(
+                f"tcpdump failed to start on {dev}: {err or 'unknown error'}")
+        return proc, pid
+
     def _find_tap_for_mac(self, vm_id: str, mac: str) -> str | None:
         """Return the host TAP device name for the VM's NIC with the given MAC."""
         res = _run(self._virsh("domiflist", vm_id), check=False)

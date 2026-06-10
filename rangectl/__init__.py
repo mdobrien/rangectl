@@ -1,4 +1,5 @@
 from rangectl.topology import Range, Link, LiveNode, Node, Topology
+from rangectl.capture import Capture
 from rangectl.cgroup import Resources
 from rangectl.dependencies import DependencySet
 from rangectl.drivers import (
@@ -19,6 +20,7 @@ __all__ = [
     "Link",
     "Range",
     "LiveNode",
+    "Capture",
     "Resources",
     "DependencySet",
     "OSDriver",

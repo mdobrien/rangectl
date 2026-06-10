@@ -9,6 +9,19 @@ from rangectl.state import StateDB
 from rangectl.types import ExecResult, VMSpec
 
 
+class _FakeProc:
+    """Stands in for the nsenter Popen handle returned by spawn_capture."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def poll(self) -> int | None:
+        return None
+
+
 class MockBackend:
     """In-memory backend that records calls and returns canned responses.
 
@@ -39,8 +52,11 @@ class MockBackend:
             available_disk_mb=500_000,
         )
         self.status_result = "running"
+        # Phase 21: canned `tc filter show` output keyed by (dev, hook).
+        self.tc_filter_results: dict[tuple[str, str], str] = {}
         self._next_vm_id = 0
         self._next_snap_id = 0
+        self._next_spawn_pid = 90000
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -142,6 +158,16 @@ class MockBackend:
             if "dev" in cmd:
                 taps.add(cmd[cmd.index("dev") + 1])
         return taps
+
+    def tc_filter_show(self, dev: str, hook: str) -> str:
+        self._record("tc_filter_show", dev, hook)
+        return self.tc_filter_results.get((dev, hook), "")
+
+    def spawn_capture(self, range_pid, dev: str, output: str,
+                      bpf: str | None = None):
+        self._record("spawn_capture", range_pid, dev, output, bpf=bpf)
+        self._next_spawn_pid += 1
+        return _FakeProc(self._next_spawn_pid), self._next_spawn_pid
 
     def create_overlay(self, base_image: str, overlay_path: str) -> str:
         self._record("create_overlay", base_image, overlay_path)
