@@ -141,6 +141,22 @@ poor ROI. Skip.
     (definition-time os defaults to linux; the engine resolves it from the image
     registry at deploy).
 
+- 2026-06-10 (layout polish, user feedback): node spacing cramped + edge-end labels
+  colliding (topo4 "eth2eth1", vlras port/eth overlaps). Fixes in `build_dot`:
+  - Graph attrs: `nodesep=1.0; ranksep=1.2; splines=true`, node `margin=0.12`.
+  - Edge-end label policy: VM ends are labeled with the iface name only when the
+    node has >=2 data interfaces (single-iface ends are redundant — the node table
+    already shows `iface — ip`). L2 port ends always labeled (port + access/trunk —
+    switch/hub nodes have no per-port rows). No-label edges emit no attr block.
+  - Remaining labels: `labelfontsize=8`, muted `labelfontcolor=#7F8C8D`,
+    `labeldistance=3.0`, `labelangle=45` — picked by rendering vlras variants
+    (45/3.0 vs -30/2.5 vs 60/2.5) and inspecting; 45/3.0 was the only one with
+    zero label/edge crossings on the 3-way switch fan-in.
+  - Visually verified topo4-diamond, vlan-ras-lab, vlan-isolation-lab,
+    hub-switch-uplink-lab, pcap-lab PNGs: no overlapping labels, clean spacing.
+  - Tests updated (label-policy assertions + new multi-iface test); Gate 1 green
+    (533 passed). Diagrams regenerated.
+
 ## Resolution
 Option A shipped: `rangectl/diagram.py` (pure DOT emitter + tolerant `dot` subprocess
 wrapper), `Topology.diagram`/`Range.diagram` SDK methods (work on undeployed

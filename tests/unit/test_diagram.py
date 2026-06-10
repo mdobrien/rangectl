@@ -53,10 +53,25 @@ def test_p2p_dot_has_nodes_os_types_ifaces_ips():
     assert ">linux<" in dot
     assert "eth1" in dot
     assert "10.0.1.1/24" in dot and "10.0.1.2/24" in dot
-    # p2p edge with iface-only end labels (IPs live in the node tables).
-    assert '"router" -- "host-a"' in dot
-    assert 'taillabel="eth1"' in dot and 'headlabel="eth1"' in dot
-    assert "10.0.1.1" not in dot.split("--")[-1].split("[")[1].split("]")[0]
+    # Single-iface nodes: edge-end labels would just repeat the node table's
+    # `iface — ip` row, so the p2p edge carries no labels at all.
+    assert '"router" -- "host-a";' in dot
+    assert "taillabel" not in dot and "headlabel" not in dot
+
+
+def test_multi_iface_nodes_keep_edge_end_labels():
+    """With >=2 data interfaces the iface name actually disambiguates which
+    NIC terminates each edge — labels stay (topo4-diamond shape)."""
+    t = Topology("diamond")
+    router = t.node("router", image="ubuntu-22.04")
+    web = t.node("web", image="ubuntu-22.04")
+    db = t.node("db", image="ubuntu-22.04")
+    t.link(router.eth1["10.0.1.1/24"], web.eth1["10.0.1.2/24"])
+    t.link(router.eth2["10.0.2.1/24"], db.eth1["10.0.2.2/24"])
+    dot = build_dot(t)
+    # router has eth1+eth2 -> its ends are labeled; web/db (one iface) not.
+    assert 'taillabel="eth1"' in dot and 'taillabel="eth2"' in dot
+    assert "headlabel" not in dot
 
 
 def test_p2p_dot_is_valid_graph_block():
@@ -64,6 +79,9 @@ def test_p2p_dot_is_valid_graph_block():
     assert dot.startswith('graph "p2p" {')
     assert dot.rstrip().endswith("}")
     assert 'fontname="Helvetica"' in dot
+    # Layout attrs so diagrams breathe (user feedback 2026-06-10).
+    assert "nodesep=" in dot and "ranksep=" in dot and "splines=true" in dot
+    assert "labeldistance=" in dot and "labelangle=" in dot
 
 
 # --- build_dot: switch + VLANs ----------------------------------------------

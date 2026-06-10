@@ -129,12 +129,21 @@ def _l2_node_dot(node: Any) -> str:
             f'fillcolor="{fill}", color="{accent}", label={label}];')
 
 
-def _end_label(topology: Any, link: Any, side: str) -> str:
-    """Edge-end label: iface name, plus the VLAN config on L2 ports.
+def _end_label(topology: Any, link: Any, side: str,
+               iface_counts: dict[str, int]) -> str | None:
+    """Edge-end label, or None when it would be redundant noise.
 
-    IPs live in the node tables already, so edge ends stay uncluttered.
+    L2 port ends are always labeled (port name + access/trunk config —
+    switch/hub nodes have no per-port table rows). A VM end gets its iface
+    name only when the node has >=2 data interfaces and the label actually
+    disambiguates; with one interface the node table's ``iface — ip`` row
+    already says it. IPs never appear on edge ends.
     """
     spec = link.if_a if side == "a" else link.if_b
+    node = topology._nodes.get(spec.node_name)
+    is_l2_end = node is not None and node.is_l2
+    if not is_l2_end and iface_counts.get(spec.node_name, 0) < 2:
+        return None
     parts = [spec.interface_name]
     vlan = getattr(spec, "vlan", None)
     if vlan is None and getattr(link, "_endpoints", None):
@@ -152,13 +161,16 @@ def build_dot(topology: Any, include_mgmt: bool = False) -> str:
     """Emit Graphviz DOT for a topology definition. Pure — no subprocess,
     no kernel, no DB; works pre-deploy."""
     ifaces = _collect_interfaces(topology)
+    iface_counts = {name: len(rows) for name, rows in ifaces.items()}
     lines = [
         f'graph "{topology.name}" {{',
         f'    label="{topology.name}"; labelloc=t; fontsize=16;',
         f'    fontname="{_FONT}";',
-        f'    node [fontname="{_FONT}", margin=0.08];',
+        "    nodesep=1.0; ranksep=1.2; splines=true;",
+        f'    node [fontname="{_FONT}", margin=0.12];',
         f'    edge [fontname="{_FONT}", fontsize=9, color="#85929E", '
-        'labelfontsize=9, labeldistance=1.8];',
+        'labelfontsize=8, labelfontcolor="#7F8C8D", labeldistance=3.0, '
+        "labelangle=45];",
         "    rankdir=TB;",
     ]
     for node in topology._nodes.values():
@@ -168,14 +180,18 @@ def build_dot(topology: Any, include_mgmt: bool = False) -> str:
             lines.append(_vm_node_dot(node, ifaces.get(node.name, {}),
                                       include_mgmt))
     for link in topology._links:
-        attrs = [
-            f'taillabel="{_end_label(topology, link, "a")}"',
-            f'headlabel="{_end_label(topology, link, "b")}"',
-        ]
+        attrs = []
+        tail = _end_label(topology, link, "a", iface_counts)
+        head = _end_label(topology, link, "b", iface_counts)
+        if tail:
+            attrs.append(f'taillabel="{tail}"')
+        if head:
+            attrs.append(f'headlabel="{head}"')
         if not getattr(link, "_is_up", True):
             attrs.append('style=dashed, color="#C0392B"')
+        suffix = f' [{", ".join(attrs)}]' if attrs else ""
         lines.append(f'    "{link.if_a.node_name}" -- '
-                     f'"{link.if_b.node_name}" [{", ".join(attrs)}];')
+                     f'"{link.if_b.node_name}"{suffix};')
     lines.append("}")
     return "\n".join(lines) + "\n"
 
