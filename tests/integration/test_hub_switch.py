@@ -20,11 +20,27 @@ import time
 import pytest
 
 from rangectl import Range
+from rangectl.state import StateDB
 from rangectl.types import CycleError
-from tests.integration.conftest import pytestmark_skip
+from tests.integration.conftest import IMAGE_PATHS, pytestmark_skip
 
 log = logging.getLogger(__name__)
 pytestmark = pytestmark_skip
+
+
+@pytest.fixture
+def default_db_with_images():
+    """The default StateDB — what a `rangectl` CLI subprocess reads — with the
+    host images registered (same plumbing as test_cli.py)."""
+    db = StateDB()
+    for name, (path, os_type) in IMAGE_PATHS.items():
+        if path.exists():
+            db.add_image(name=name, path=str(path), inject="cloud-init",
+                         os_type=os_type)
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def _avg_rtt(ping_output: str) -> float:
@@ -146,13 +162,17 @@ class LoopedLab(Range):
         pass
 
 
-def test_switch_forwarding_and_isolation(backend, db):
+def test_switch_forwarding_and_isolation(backend, default_db_with_images):
     """All VMs ping through the switch; after MAC learning, the IDS port does
     NOT receive other VMs' unicast (a switch forwards learned unicast only).
-    Also: impairment on a VM<->switch link lands on the single VM TAP."""
+    Also: impairment on a VM<->switch link lands on the single VM TAP.
+
+    Deploys against the DEFAULT StateDB so the `rangectl status` subprocess
+    check at the end can see the range (the CLI reads ~/.rangectl)."""
     lab = SwitchLab()
     try:
-        lab.deploy(backend=backend, db=db, use_namespaces=True)
+        lab.deploy(backend=backend, db=default_db_with_images,
+                   use_namespaces=True)
 
         # 1. Full mesh through the switch.
         for src, dst in (("a", "10.0.1.2"), ("a", "10.0.1.3"),

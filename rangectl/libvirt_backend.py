@@ -556,9 +556,19 @@ class LibvirtBackend:
         if not learning:
             # Drop anything learned before the flag landed (e.g. during VM
             # boot, when libvirt enslaves the TAP ahead of link wiring) —
-            # stale FDB entries would make a hub behave like a switch for up
-            # to the ageing time. Best-effort: older iproute2 lacks flush.
-            _run(self._ip("bridge", "fdb", "flush", "dev", port), check=False)
+            # stale FDB entries make a hub forward learned unicast like a
+            # switch until the ~300s ageing expires. `bridge fdb flush` only
+            # exists in iproute2 >= 6.1, so delete dynamic entries one by one
+            # (permanent entries are the port device's own MAC — skipped).
+            # See 20260609-13-gate2-hub-flood-fdb-flush.md.
+            res = _run(self._ip("bridge", "fdb", "show", "brport", port),
+                       check=False)
+            for line in (res.stdout or "").splitlines():
+                fields = line.split()
+                if not fields or "permanent" in fields:
+                    continue
+                _run(self._ip("bridge", "fdb", "del", fields[0],
+                              "dev", port, "master"), check=False)
 
     def run_tc(self, cmds: list[list[str]]) -> None:
         """Run pre-built tc commands (each a full argv, netns-prefixed by the

@@ -166,3 +166,57 @@ def test_socket_and_netns_together():
     cmds = _cmds(run)
     assert cmds[0][:3] == ["virsh", "-c", CONN]
     assert cmds[1][:4] == ["ip", "netns", "exec", "rangectl-lab1"]
+
+
+# --- Phase 20: hub port flags + portable FDB clear ---------------------------
+
+FDB_SHOW = (
+    "fe:54:00:aa:bb:01 vlan 1 master hub-mon permanent\n"
+    "fe:54:00:aa:bb:01 master hub-mon permanent\n"
+    "52:54:00:11:22:33 master hub-mon\n"
+    "52:54:00:44:55:66 master hub-mon\n"
+)
+
+
+def test_set_port_flags_hub_disables_learning_and_floods():
+    be = LibvirtBackend(netns_name="rangectl-lab1")
+    with patch("rangectl.libvirt_backend._run") as run:
+        run.return_value = _ok()
+        be.set_port_flags("vnet3", learning=False, flood=True)
+    cmds = _cmds(run)
+    assert ["ip", "netns", "exec", "rangectl-lab1",
+            "bridge", "link", "set", "dev", "vnet3",
+            "learning", "off", "flood", "on"] in cmds
+
+
+def test_set_port_flags_clears_learned_fdb_entries_portably():
+    """iproute2 < 6.1 has no `bridge fdb flush`; learned entries must be
+    deleted individually or a hub keeps switching for the ageing window."""
+    be = LibvirtBackend(netns_name="rangectl-lab1")
+
+    def fake_run(cmd, check=True):
+        if "show" in cmd and "fdb" in cmd:
+            return _ok(stdout=FDB_SHOW)
+        return _ok()
+
+    with patch("rangectl.libvirt_backend._run", side_effect=fake_run) as run:
+        be.set_port_flags("vnet3", learning=False, flood=True)
+    cmds = _cmds(run)
+    ns = ["ip", "netns", "exec", "rangectl-lab1"]
+    assert ns + ["bridge", "fdb", "show", "brport", "vnet3"] in cmds
+    assert ns + ["bridge", "fdb", "del", "52:54:00:11:22:33",
+                 "dev", "vnet3", "master"] in cmds
+    assert ns + ["bridge", "fdb", "del", "52:54:00:44:55:66",
+                 "dev", "vnet3", "master"] in cmds
+    # Permanent entries (the port device's own MAC) are left alone.
+    assert not any("fe:54:00:aa:bb:01" in c for c in cmds if "del" in c)
+    # No reliance on the 6.1-only flush subcommand.
+    assert not any("flush" in c for c in cmds)
+
+
+def test_set_port_flags_learning_on_skips_fdb_clear():
+    be = LibvirtBackend(netns_name="rangectl-lab1")
+    with patch("rangectl.libvirt_backend._run") as run:
+        run.return_value = _ok()
+        be.set_port_flags("vnet3", learning=True, flood=True)
+    assert not any("fdb" in c for c in _cmds(run))
