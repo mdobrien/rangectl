@@ -60,6 +60,7 @@ def _captured_lines(ids) -> list[str]:
 class SwitchLab(Range):
     """Three VMs on one switch; c doubles as the switch-side IDS."""
     name = "swlab"
+    internet = "full"  # apt-get tcpdump (Phase 16c: per-range opt-in NAT)
 
     def define_nodes(self):
         self.a = self.node("a", image="ubuntu-22.04", vcpu=1, memory=1024)
@@ -82,6 +83,7 @@ class SwitchLab(Range):
 class HubLab(Range):
     """Two talkers + a passive IDS on one hub — IDS must see their unicast."""
     name = "hublab"
+    internet = "full"  # apt-get tcpdump
 
     def define_nodes(self):
         self.a = self.node("a", image="ubuntu-22.04", vcpu=1, memory=1024)
@@ -104,6 +106,7 @@ class HubLab(Range):
 class UplinkLab(Range):
     """switch <-> hub veth uplink: a on the switch, b + IDS on the hub."""
     name = "uplab"
+    internet = "full"  # apt-get tcpdump
 
     def define_nodes(self):
         self.a = self.node("a", image="ubuntu-22.04", vcpu=1, memory=1024)
