@@ -5,6 +5,13 @@ import ipaddress
 HOST_OFFSET = 254  # host always at .254 within a /24 mgmt subnet
 IFNAME_MAX = 15  # Linux IFNAMSIZ - 1
 
+# The persistent management namespace interposed between the host and every
+# range namespace (Phase 16). Per-range veths, routes, and NAT chains live
+# INSIDE this namespace; the host carries only 4 static ops. Defined here (the
+# dependency-free constants module) so netns/internet/mgmt_namespace/engine can
+# all share one name without import cycles.
+MGMT_NS = "rangectl-mgmt"
+
 
 def _net(subnet: str) -> ipaddress.IPv4Network:
     return ipaddress.IPv4Network(subnet, strict=False)

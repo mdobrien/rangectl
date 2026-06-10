@@ -416,6 +416,12 @@ class Engine:
     def _setup_namespace(self, topology_name: str, mgmt_subnet: str) -> None:
         """Create cgroup (if resources requested), the range namespaces +
         per-range libvirtd, and the per-range LibvirtBackend bound to them."""
+        # Ensure the persistent management namespace + its 4 static host ops
+        # exist and are healthy BEFORE any per-range veth is wired into it.
+        # Verify-and-heal each deploy (the kernel is the source of truth).
+        from rangectl import mgmt_namespace
+        mgmt_namespace.ensure_mgmt_ns()
+
         cgroup_path: str | None = None
         if self._resources is not None:
             cgroup_path = cgroup.create_cgroup(topology_name, self._resources)
@@ -438,9 +444,12 @@ class Engine:
             cgroup.write_pid(cgroup_path, info.pid)
 
         # Apply the initial internet policy. The veth pair is the choke point,
-        # so MASQUERADE-ing its traffic gives the whole range outbound access.
+        # so MASQUERADE-ing its traffic (inside the mgmt-ns) gives the whole
+        # range outbound access.
         if self._internet == "full":
-            internet.enable_internet(topology_name, mgmt_subnet, info.veth_host)
+            from rangectl.networking import MGMT_NS
+            internet.enable_internet(topology_name, mgmt_subnet,
+                                     info.veth_host, netns=MGMT_NS)
 
     def _deploy_wave(self, topology: Topology, wave: list[Node],
                      mgmt_subnet: str, mgmt_bridge: str,
@@ -853,12 +862,12 @@ class Engine:
     def _teardown_namespace(self, topology_name: str) -> None:
         """Tear down the range's namespaces + per-range libvirtd, then its
         cgroup (if one was created)."""
-        # Remove the range's internet rules first, while we still have its
-        # veth/subnet (destroy_range deletes the netns + veth afterwards).
-        info = self._range_info.get(topology_name)
-        if info is not None and self._internet == "full":
-            internet.disable_internet(topology_name, info.mgmt_subnet,
-                                      info.veth_host)
+        # The range's internet rules are removed inside destroy_range ->
+        # mgmt_namespace.disconnect_range, which ALWAYS calls disable_internet
+        # (idempotent) regardless of the engine's internet flag. That
+        # unconditional teardown is the H5 fix: a range whose internet was
+        # enabled at runtime no longer leaks a stale POSTROUTING jump into the
+        # mgmt-ns for the next range that recycles its /24.
         supervisor.destroy_range(topology_name)
         self._range_info.pop(topology_name, None)
         self._range_backends.pop(topology_name, None)

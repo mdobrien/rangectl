@@ -128,5 +128,7 @@ Suggested split for coding agents (each one context window):
     - Post-run: no rangectl netns, no qemu orphans, no leftover mgmt MASQUERADE. Instance left running.
   - NOT in scope (16b): `mgmt_namespace.py`, host-CIDR overlap abort (D3b), host route changes.
 
+- 2026-06-09: **16b DONE** — new `rangectl/mgmt_namespace.py` (`ensure_mgmt_ns` verify-and-heal + flock + D3b overlap abort + heal-reconnect from `/ranges/*/range.json`; `connect_range`/`disconnect_range`/`destroy_mgmt_ns`/`status`; `RANGECTL_MGMT_TRANSIT`). Rewired `netns.py` (per-range `mgh<hash>` + gateway + FORWARD/isolation now inside `rangectl-mgmt`), `internet.py` (`netns=` param → `RANGE-<name>` chain in mgmt-ns), engine/supervisor/topology call sites. **H5 fixed**: teardown always disables internet (`destroy_range`→`disconnect_range`, idempotent). Orphan sweeps exclude `rangectl-mgmt`. **Egress NAT**: host static MASQUERADE is `-s <transit /30>` (not the aggregate); `full` ranges MASQUERADE to the transit in the mgmt-ns and the host re-NATs, `none` ranges have no chain so the transit MASQUERADE never matches — free gating. Gate 1: 358 unit, 0 skips. Gate 2 (EC2): smoke a–d + `test_ns_two_node` + internet none/full/toggle all green. See `20260603-1` progress log for full detail. 16c (CLI + broad suite) remains.
+
 ## Resolution
-16a complete — see 2026-06-09 progress entry. Pool is 10.255.0.0/16; `RANGECTL_MGMT_POOL` overridable & validated. 16b/16c remain.
+16a + 16b complete — see progress entries. Pool is 10.255.0.0/16; transit `10.254.0.0/30` (`RANGECTL_MGMT_TRANSIT`). Persistent `rangectl-mgmt` interposed; host carries only the 4 static ops. 16c remains: `rangectl mgmt-ns status/reset` CLI + broad integration-suite migration (retire conftest blanket NAT per D4).

@@ -52,45 +52,50 @@ def test_create_mgmt_network_builds_bridge_in_netns():
             "ip", "link", "set", "mgmt-br", "up"] in cmds
 
 
-def test_create_mgmt_network_creates_veth_pair_into_netns():
+MGMT = ["ip", "netns", "exec", "rangectl-mgmt"]
+
+
+def test_create_mgmt_network_creates_veth_pair_into_namespaces():
     with patch("rangectl.netns._run") as run:
         run.return_value = _ok()
         mgmt = netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
-    # veth pair created on the host, ns-side moved into the netns.
+    # veth pair created on the host transiently, then BOTH ends moved out:
+    # mgp into the range netns, mgh into the persistent mgmt-ns.
     assert ["ip", "link", "add", mgmt.veth_host, "type", "veth",
             "peer", "name", mgmt.veth_ns] in cmds
     assert ["ip", "link", "set", mgmt.veth_ns, "netns", "rangectl-lab1"] in cmds
-    # ns-side enslaved to the bridge inside the netns.
+    assert ["ip", "link", "set", mgmt.veth_host, "netns", "rangectl-mgmt"] in cmds
+    # ns-side enslaved to the bridge inside the range netns.
     assert ["ip", "netns", "exec", "rangectl-lab1",
             "ip", "link", "set", mgmt.veth_ns, "master", "mgmt-br"] in cmds
 
 
-def test_create_mgmt_network_assigns_host_ip_and_route():
+def test_create_mgmt_network_assigns_gateway_ip_in_mgmt_ns():
     with patch("rangectl.netns._run") as run:
         run.return_value = _ok()
         mgmt = netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
-    # Host-side veth gets the .254 address (connected route to the subnet).
-    assert ["ip", "addr", "add", "10.255.1.254/24",
+    # The .254 gateway now lives on the mgmt-ns side of the veth.
+    assert [*MGMT, "ip", "addr", "add", "10.255.1.254/24",
             "dev", mgmt.veth_host] in cmds
-    assert ["ip", "link", "set", mgmt.veth_host, "up"] in cmds
+    assert [*MGMT, "ip", "link", "set", mgmt.veth_host, "up"] in cmds
 
 
-def test_create_mgmt_network_installs_iptables_forward_accept():
+def test_create_mgmt_network_installs_iptables_forward_accept_in_mgmt_ns():
     with patch("rangectl.netns._run") as run:
         # iptables -C (check) returns non-zero so the rule is inserted; all
         # other commands succeed.
         def side_effect(cmd, **kw):
-            if cmd[:3] == ["iptables", "-C", "FORWARD"]:
+            if cmd[:6] == [*MGMT, "iptables", "-C"]:
                 return _ok(rc=1)
             return _ok()
         run.side_effect = side_effect
         netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
-    assert ["iptables", "-I", "FORWARD", "1",
+    assert [*MGMT, "iptables", "-I", "FORWARD", "1",
             "-s", "10.255.1.0/24", "-j", "ACCEPT"] in cmds
-    assert ["iptables", "-I", "FORWARD", "1",
+    assert [*MGMT, "iptables", "-I", "FORWARD", "1",
             "-d", "10.255.1.0/24", "-j", "ACCEPT"] in cmds
 
 
@@ -100,35 +105,38 @@ def test_create_mgmt_network_iptables_idempotent():
         run.return_value = _ok(rc=0)
         netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
-    inserts = [c for c in cmds if c[:3] == ["iptables", "-I", "FORWARD"]]
+    inserts = [c for c in cmds if c[:6] == [*MGMT, "iptables", "-I"]]
     # The per-subnet ACCEPTs are skipped (already present), but the inter-range
     # isolation DROPs are always re-inserted (delete-then-insert by design) —
     # one per ordered pair of mgmt prefixes (mgh+/rlmgt+), covering cross-scheme.
     from rangectl.networking import mgmt_isolation_rules
-    expected = [["iptables", "-I", "FORWARD", "1", *rule]
+    expected = [[*MGMT, "iptables", "-I", "FORWARD", "1", *rule]
                 for rule in mgmt_isolation_rules()]
     assert inserts == expected
 
 
 def test_create_mgmt_network_installs_inter_range_isolation_drop():
-    """A DROP for mgh+ -> mgh+ must be re-asserted at the top of FORWARD, after
-    the per-subnet ACCEPTs, so cross-range mgmt routing is blocked."""
+    """A DROP for mgh+ -> mgh+ must be re-asserted at the top of the mgmt-ns
+    FORWARD chain, after the per-subnet ACCEPTs, so cross-range routing is
+    blocked."""
     with patch("rangectl.netns._run") as run:
         # iptables -C returns non-zero (rule absent) so ACCEPTs insert; every
         # other command (ip link, etc.) succeeds.
         def side_effect(cmd, **kw):
-            if cmd[:3] == ["iptables", "-C", "FORWARD"]:
+            if cmd[:6] == [*MGMT, "iptables", "-C"]:
                 return _ok(rc=1)
             return _ok()
         run.side_effect = side_effect
         netns.create_mgmt_network("rangectl-lab1", "10.255.1.0/24", "lab1")
     cmds = _cmds(run)
-    drop_del = ["iptables", "-D", "FORWARD", "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
-    drop_ins = ["iptables", "-I", "FORWARD", "1", "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
+    drop_del = [*MGMT, "iptables", "-D", "FORWARD",
+                "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
+    drop_ins = [*MGMT, "iptables", "-I", "FORWARD", "1",
+                "-i", "mgh+", "-o", "mgh+", "-j", "DROP"]
     assert drop_del in cmds and drop_ins in cmds
     # DROP insert must come after the subnet ACCEPT inserts (so it lands on top).
     accept_idx = max(i for i, c in enumerate(cmds)
-                     if c[:4] == ["iptables", "-I", "FORWARD", "1"]
+                     if c[:8] == [*MGMT, "iptables", "-I", "FORWARD", "1"]
                      and "ACCEPT" in c)
     assert cmds.index(drop_ins) > accept_idx
 
@@ -157,11 +165,11 @@ def test_destroy_mgmt_network_removes_veth_and_iptables():
         run.return_value = _ok()
         netns.destroy_mgmt_network(mgmt)
     cmds = _cmds(run)
-    # Deleting the host-side veth removes the whole pair.
-    assert ["ip", "link", "delete", "mgh12345678"] in cmds
-    assert ["iptables", "-D", "FORWARD",
+    # Deleting the mgmt-ns-side veth removes the whole pair.
+    assert [*MGMT, "ip", "link", "delete", "mgh12345678"] in cmds
+    assert [*MGMT, "iptables", "-D", "FORWARD",
             "-s", "10.255.1.0/24", "-j", "ACCEPT"] in cmds
-    assert ["iptables", "-D", "FORWARD",
+    assert [*MGMT, "iptables", "-D", "FORWARD",
             "-d", "10.255.1.0/24", "-j", "ACCEPT"] in cmds
 
 

@@ -51,11 +51,16 @@ def _sweep_ranges():
 
     A half-built range (deploy failed mid-way) leaves a named netns plus a
     host-side mgmt veth; deleting the netns orphans the veth, so sweep both.
+
+    The persistent ``rangectl-mgmt`` namespace (Phase 16) is host
+    infrastructure — NEVER swept here. It is excluded by exact name; the next
+    deploy's ``ensure_mgmt_ns()`` would heal it regardless, but leaving it in
+    place avoids needless churn between tests.
     """
     r = subprocess.run(["ip", "netns", "list"], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         ns = line.split()[0] if line.strip() else ""
-        if ns.startswith("rangectl-"):
+        if ns.startswith("rangectl-") and ns != "rangectl-mgmt":
             subprocess.run(["ip", "netns", "del", ns], capture_output=True)
     links = subprocess.run(["ip", "-br", "link", "show"],
                            capture_output=True, text=True)

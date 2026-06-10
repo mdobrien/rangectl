@@ -56,6 +56,13 @@ def ns(monkeypatch):
     monkeypatch.setattr(Engine, "_make_range_backend",
                         lambda self, info: range_backend)
 
+    # _setup_namespace ensures the persistent mgmt-ns first; that runs real `ip`
+    # commands, so stub it out for the in-memory engine tests.
+    import rangectl.mgmt_namespace as mgmt_ns_mod
+    ensure_calls: list[bool] = []
+    monkeypatch.setattr(mgmt_ns_mod, "ensure_mgmt_ns",
+                        lambda *a, **k: ensure_calls.append(True))
+
     cgroup_calls: list[tuple] = []
     monkeypatch.setattr(engine_mod.cgroup, "create_cgroup",
                         lambda name, res: cgroup_calls.append(("create", name, res))
@@ -67,11 +74,14 @@ def ns(monkeypatch):
 
     internet_calls: list[tuple] = []
     monkeypatch.setattr(engine_mod.internet, "enable_internet",
-                        lambda name, subnet, veth: internet_calls.append(
-                            ("enable", name, subnet, veth)))
+                        lambda name, subnet, veth, netns=None: internet_calls.append(
+                            ("enable", name, subnet, veth, netns)))
+    # Engine no longer calls disable_internet directly — teardown routes through
+    # destroy_range -> mgmt_namespace.disconnect_range (the H5 fix). Mock it
+    # anyway so any stray engine-level call would be caught.
     monkeypatch.setattr(engine_mod.internet, "disable_internet",
-                        lambda name, subnet, veth: internet_calls.append(
-                            ("disable", name, subnet, veth)))
+                        lambda name, subnet, veth, netns=None: internet_calls.append(
+                            ("disable", name, subnet, veth, netns)))
 
     return type("NS", (), {
         "info": info,
@@ -80,6 +90,7 @@ def ns(monkeypatch):
         "range_backend": range_backend,
         "cgroup_calls": cgroup_calls,
         "internet_calls": internet_calls,
+        "ensure_calls": ensure_calls,
     })
 
 
@@ -261,10 +272,12 @@ def test_deploy_without_resources_skips_cgroup(backend, db, ns):
 # --- internet policy -------------------------------------------------------
 
 def test_deploy_full_internet_enables_during_setup(backend, db, ns):
+    from rangectl.networking import MGMT_NS
     engine = Engine(backend, db, use_namespaces=True, internet="full")
     topo = _two_node_link_topo()
     engine.deploy(topo)
-    assert ("enable", "nsr", "10.255.1.0/24", "mgh1234") in ns.internet_calls
+    # enable_internet now runs inside the mgmt-ns (netns=rangectl-mgmt).
+    assert ("enable", "nsr", "10.255.1.0/24", "mgh1234", MGMT_NS) in ns.internet_calls
 
 
 def test_deploy_none_internet_does_not_enable(backend, db, ns):
@@ -273,12 +286,23 @@ def test_deploy_none_internet_does_not_enable(backend, db, ns):
     assert ns.internet_calls == []
 
 
-def test_destroy_full_internet_disables(backend, db, ns):
+def test_destroy_routes_internet_teardown_through_destroy_range(backend, db, ns):
+    """The engine no longer disables internet itself (H5 fix): teardown calls
+    destroy_range, which -> mgmt_namespace.disconnect_range, which ALWAYS
+    disables internet (idempotent). So the engine issues no direct disable."""
     engine = Engine(backend, db, use_namespaces=True, internet="full")
     topo = _two_node_link_topo()
     engine.deploy(topo)
     engine.destroy(topo)
-    assert ("disable", "nsr", "10.255.1.0/24", "mgh1234") in ns.internet_calls
+    assert ns.destroyed == ["nsr"]
+    assert not any(c[0] == "disable" for c in ns.internet_calls)
+
+
+def test_deploy_ensures_mgmt_ns_first(backend, db, ns):
+    """ns-mode deploy must ensure the persistent mgmt-ns before wiring ranges."""
+    engine = Engine(backend, db, use_namespaces=True)
+    engine.deploy(_two_node_link_topo())
+    assert ns.ensure_calls == [True]
 
 
 def test_deploy_full_internet_wires_range_controls(backend, db, ns):

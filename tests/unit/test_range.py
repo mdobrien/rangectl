@@ -234,9 +234,11 @@ def test_range_enable_internet_calls_module(monkeypatch):
     from rangectl import internet as internet_mod
     calls = []
     monkeypatch.setattr(internet_mod, "enable_internet",
-                        lambda n, subnet, veth: calls.append(("enable", n, subnet, veth)))
+                        lambda n, subnet, veth, netns=None: calls.append(
+                            ("enable", n, subnet, veth, netns)))
     monkeypatch.setattr(internet_mod, "disable_internet",
-                        lambda n, subnet, veth: calls.append(("disable", n, subnet, veth)))
+                        lambda n, subnet, veth, netns=None: calls.append(
+                            ("disable", n, subnet, veth, netns)))
     rng = _range("inet")
     rng._mgmt_subnet = "10.255.1.0/24"
     rng._veth_host = "mgh1234"
@@ -244,9 +246,10 @@ def test_range_enable_internet_calls_module(monkeypatch):
     assert rng.internet == "full"
     rng.disable_internet()
     assert rng.internet == "none"
+    # Runtime toggle now acts inside the persistent mgmt-ns.
     assert calls == [
-        ("enable", "inet", "10.255.1.0/24", "mgh1234"),
-        ("disable", "inet", "10.255.1.0/24", "mgh1234"),
+        ("enable", "inet", "10.255.1.0/24", "mgh1234", "rangectl-mgmt"),
+        ("disable", "inet", "10.255.1.0/24", "mgh1234", "rangectl-mgmt"),
     ]
 
 

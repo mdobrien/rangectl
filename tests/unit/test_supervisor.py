@@ -187,7 +187,7 @@ def test_destroy_range_kills_pid_and_cleans_up(created):
     root = ctx["root"]
     with patch("rangectl.supervisor._run") as run, \
          patch("rangectl.supervisor.os.kill") as kill, \
-         patch("rangectl.supervisor.netns.destroy_mgmt_network") as dmn, \
+         patch("rangectl.mgmt_namespace.disconnect_range") as disc, \
          patch("rangectl.supervisor.time.sleep"):
         run.return_value = _ok()
         supervisor.destroy_range("lab1", range_dir=str(root))
@@ -195,11 +195,11 @@ def test_destroy_range_kills_pid_and_cleans_up(created):
     # libvirtd host-PID is signalled (SIGKILL guarantees pidns reap).
     signals = [c.args[1] for c in kill.call_args_list]
     assert signal.SIGKILL in signals
-    # mgmt network torn down with the reconstructed handle.
-    dmn.assert_called_once()
-    mgmt_arg = dmn.call_args.args[0]
-    assert mgmt_arg.veth_host == "mgh12345678"
-    assert mgmt_arg.subnet == "10.255.1.0/24"
+    # Range disconnected from the mgmt-ns (disable internet + veth teardown).
+    disc.assert_called_once()
+    assert disc.call_args.args[0] == "lab1"
+    assert disc.call_args.args[1] == "10.255.1.0/24"
+    assert disc.call_args.args[2] == "mgh12345678"
     # named netns deleted.
     cmds = [c.args[0] for c in run.call_args_list]
     assert ["ip", "netns", "del", "rangectl-lab1"] in cmds
@@ -222,7 +222,7 @@ def test_destroy_range_tolerates_dead_pid(created):
     with patch("rangectl.supervisor._run") as run, \
          patch("rangectl.supervisor.os.kill",
                side_effect=ProcessLookupError) as kill, \
-         patch("rangectl.supervisor.netns.destroy_mgmt_network"), \
+         patch("rangectl.mgmt_namespace.disconnect_range"), \
          patch("rangectl.supervisor.time.sleep"):
         run.return_value = _ok()
         # Should swallow the already-dead PID and finish cleanup.

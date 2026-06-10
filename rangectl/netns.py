@@ -5,11 +5,12 @@ the namespace, so their names are clean and unscoped — ``mgmt-br``, ``data-0``
 ``data-1`` — with no IFNAMSIZ hashing, because collisions across ranges are
 structurally impossible.
 
-The management network connects the range's ``mgmt-br`` to the host via a veth
-pair. The host-side veth carries the ``.254`` gateway address; VMs reach the
-host (and the host reaches VMs) over that L2 segment. A FORWARD ACCEPT rule for
-the management CIDR lets the host route traffic into the range when acting as a
-gateway for remote dev access.
+The management network connects the range's ``mgmt-br`` to the persistent
+management namespace (``rangectl-mgmt``, Phase 16) via a veth pair. The
+mgmt-ns-side veth (``mgh<hash>``) carries the ``.254`` gateway address; VMs
+reach the host (and the host reaches VMs) through the mgmt-ns. A FORWARD ACCEPT
+rule for the management CIDR — installed INSIDE the mgmt-ns — lets it route
+traffic into the range. The host itself carries no per-range rules.
 """
 from __future__ import annotations
 import hashlib
@@ -17,11 +18,14 @@ import logging
 import subprocess
 from dataclasses import dataclass
 
-from rangectl.networking import mgmt_host_ip
+from rangectl.networking import MGMT_NS, mgmt_host_ip
 
 log = logging.getLogger(__name__)
 
 MGMT_BRIDGE = "mgmt-br"
+
+# Run a command inside the persistent management namespace.
+_MGMT_EXEC = ["ip", "netns", "exec", MGMT_NS]
 
 
 def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -66,39 +70,45 @@ def _add_bridge_in_netns(netns_name: str, bridge: str) -> None:
 
 
 def _iptables_forward_accept(subnet: str) -> None:
-    """Insert FORWARD ACCEPT rules for the mgmt CIDR (idempotent)."""
+    """Insert FORWARD ACCEPT rules for the mgmt CIDR (idempotent), inside the
+    mgmt-ns where the ``.254`` gateway and the range veths now live."""
     for direction in ("-s", "-d"):
         rule = [direction, subnet, "-j", "ACCEPT"]
-        if _run(["iptables", "-C", "FORWARD", *rule], check=False).returncode == 0:
+        if _run([*_MGMT_EXEC, "iptables", "-C", "FORWARD", *rule],
+                check=False).returncode == 0:
             continue
-        _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
+        _run([*_MGMT_EXEC, "iptables", "-I", "FORWARD", "1", *rule], check=False)
 
 
 def _ensure_mgmt_isolation() -> None:
-    """Block forwarding *between* ranges' management interfaces.
+    """Block forwarding *between* ranges' management interfaces, inside the mgmt-ns.
 
-    ``ip_forward=1`` (needed for internet=full MASQUERADE) otherwise lets the
-    host route packets from one range's mgmt subnet to another's, because the
-    host carries an on-link ``.254`` address on every range's host-side veth
-    (``mgh<hash>``) and legacy mgmt bridge (``rlmgt-<hash>``). The per-subnet
-    ACCEPT rules above would then permit the cross-range hop. DROPs for every
-    ordered pair of mgmt prefixes — including the cross-scheme ``mgh+ <-> rlmgt+``
-    pair when namespace and legacy ranges run concurrently — close that path
-    while leaving host<->range and range->internet (``-o <uplink>``) untouched.
+    ``ip_forward=1`` (needed for internet=full forwarding) otherwise lets the
+    mgmt-ns route packets from one range's mgmt subnet to another's, because it
+    carries an on-link ``.254`` address on every range's veth (``mgh<hash>``).
+    The per-subnet ACCEPT rules above would then permit the cross-range hop.
+    DROPs for every ordered pair of mgmt prefixes close that path while leaving
+    host<->range and range->internet untouched.
 
-    Kept at the very top of FORWARD (delete-then-insert avoids duplicates and
-    re-promotes them above the per-subnet ACCEPTs every range adds). They are
-    shared, range-agnostic rules, so teardown deliberately leaves them in place."""
+    Kept at the very top of the mgmt-ns FORWARD chain (delete-then-insert avoids
+    duplicates and re-promotes them above the per-subnet ACCEPTs every range
+    adds). They are shared, range-agnostic rules, so teardown deliberately
+    leaves them in place."""
     from rangectl.networking import mgmt_isolation_rules
     for rule in mgmt_isolation_rules():
-        _run(["iptables", "-D", "FORWARD", *rule], check=False)
-        _run(["iptables", "-I", "FORWARD", "1", *rule], check=False)
+        _run([*_MGMT_EXEC, "iptables", "-D", "FORWARD", *rule], check=False)
+        _run([*_MGMT_EXEC, "iptables", "-I", "FORWARD", "1", *rule], check=False)
 
 
 def create_mgmt_network(netns_name: str, mgmt_subnet: str,
                         range_name: str) -> MgmtNetwork:
-    """Create the mgmt bridge in ``netns_name``, link it to the host via a veth
-    pair, assign the host gateway IP, and allow forwarding for the subnet."""
+    """Create the mgmt bridge in ``netns_name``, link it to the mgmt-ns via a
+    veth pair, assign the ``.254`` gateway IP on the mgmt-ns side, and allow
+    forwarding for the subnet inside the mgmt-ns.
+
+    The veth pair is created on the host transiently, then BOTH ends are moved
+    out of the host namespace — ``mgp<hash>`` into the range netns, ``mgh<hash>``
+    into ``rangectl-mgmt`` — so the host carries no per-range interface."""
     log.info("create_mgmt_network: ns=%s subnet=%s range=%s",
              netns_name, mgmt_subnet, range_name)
     host_ip = mgmt_host_ip(mgmt_subnet)
@@ -110,13 +120,16 @@ def create_mgmt_network(netns_name: str, mgmt_subnet: str,
     _run(["ip", "link", "add", veth_host, "type", "veth",
           "peer", "name", veth_ns])
     _run(["ip", "link", "set", veth_ns, "netns", netns_name])
+    # The gateway side moves into the persistent mgmt-ns (was the host).
+    _run(["ip", "link", "set", veth_host, "netns", MGMT_NS])
     _run(["ip", "netns", "exec", netns_name,
           "ip", "link", "set", veth_ns, "master", MGMT_BRIDGE])
     _run(["ip", "netns", "exec", netns_name,
           "ip", "link", "set", veth_ns, "up"])
 
-    _run(["ip", "link", "set", veth_host, "up"])
-    _run(["ip", "addr", "add", f"{host_ip}/{prefix}", "dev", veth_host])
+    _run([*_MGMT_EXEC, "ip", "link", "set", veth_host, "up"])
+    _run([*_MGMT_EXEC, "ip", "addr", "add", f"{host_ip}/{prefix}",
+          "dev", veth_host])
 
     _iptables_forward_accept(mgmt_subnet)
     # Re-assert inter-range isolation last, so its DROP sits above the per-subnet
@@ -133,13 +146,13 @@ def create_mgmt_network(netns_name: str, mgmt_subnet: str,
 
 
 def destroy_mgmt_network(mgmt: MgmtNetwork) -> None:
-    """Tear down the management network. Deleting the host-side veth removes the
-    whole pair; the connected route disappears with it."""
+    """Tear down the management network. Deleting the mgmt-ns-side veth removes
+    the whole pair; the connected route disappears with it."""
     log.info("destroy_mgmt_network: veth_host=%s subnet=%s",
              mgmt.veth_host, mgmt.subnet)
-    _run(["ip", "link", "delete", mgmt.veth_host], check=False)
+    _run([*_MGMT_EXEC, "ip", "link", "delete", mgmt.veth_host], check=False)
     for direction in ("-s", "-d"):
-        _run(["iptables", "-D", "FORWARD", direction, mgmt.subnet,
+        _run([*_MGMT_EXEC, "iptables", "-D", "FORWARD", direction, mgmt.subnet,
               "-j", "ACCEPT"], check=False)
 
 

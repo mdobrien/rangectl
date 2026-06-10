@@ -94,6 +94,15 @@ Reaper: `scratch/scripts/` (see the reaper used in `20260602-1`). A real
 `rangectl test --parallel` should pair in-process timeouts with a post-run leak
 assert (`netns == veth == qemu == 0`) as a backstop.
 
+**Phase 16 — `rangectl-mgmt` is persistent.** Any netns sweep that deletes
+`rangectl*` namespaces MUST exclude `rangectl-mgmt` by exact name (e.g.
+`ip netns list | grep rangectl | grep -v rangectl-mgmt`). It is host
+infrastructure — never auto-destroyed (D5). If it is deleted while ranges run,
+the next deploy's `ensure_mgmt_ns()` recreates it and reconnects the running
+ranges. The per-range leak assert is unchanged: deployed ranges still settle to
+`netns == veth == 0` *for their own* namespaces (the one persistent
+`rangectl-mgmt` aside).
+
 ## Gotchas
 
 - `arg ranges/nodes` resolve via the default DB — wrong host = "not found".

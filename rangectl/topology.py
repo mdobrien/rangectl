@@ -901,9 +901,10 @@ class Range:
                 "enable_internet() requires a namespace-mode range "
                 "(deploy with use_namespaces=True)"
             )
+        from rangectl.networking import MGMT_NS
         log.info("Enabling internet for range '%s'", self.topology.name)
         internet_mod.enable_internet(self.topology.name, self._mgmt_subnet,
-                                     self._veth_host)
+                                     self._veth_host, netns=MGMT_NS)
         self.internet = "full"
         if self._db is not None:
             self._db.log_event(self.topology.name, None, "info", "internet enabled")
@@ -916,9 +917,10 @@ class Range:
                 "disable_internet() requires a namespace-mode range "
                 "(deploy with use_namespaces=True)"
             )
+        from rangectl.networking import MGMT_NS
         log.info("Disabling internet for range '%s'", self.topology.name)
         internet_mod.disable_internet(self.topology.name, self._mgmt_subnet,
-                                      self._veth_host)
+                                      self._veth_host, netns=MGMT_NS)
         self.internet = "none"
         if self._db is not None:
             self._db.log_event(self.topology.name, None, "info", "internet disabled")

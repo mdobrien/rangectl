@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rangectl import netns
-from rangectl.netns import MgmtNetwork
 
 log = logging.getLogger(__name__)
 
@@ -244,13 +243,18 @@ def destroy_range(name: str, range_dir: str = DEFAULT_RANGE_DIR) -> None:
     state = json.loads(state_file.read_text())
     _terminate(state["pid"])
 
-    netns.destroy_mgmt_network(MgmtNetwork(
-        bridge_name=netns.MGMT_BRIDGE,
-        veth_host=state["veth_host"],
+    # Drop the range's mgmt-ns wiring. disconnect_range ALWAYS disables internet
+    # first (idempotent) — that unconditional call is the H5 fix: a runtime-
+    # enabled range no longer leaks a stale NAT jump to the next range that
+    # recycles its /24 (see 20260609-3 finding H5).
+    from rangectl import mgmt_namespace
+    mgmt_namespace.disconnect_range(
+        state_file.parent.name,
+        state["subnet"],
+        state["veth_host"],
         veth_ns=state["veth_ns"],
         host_ip=state["host_ip"],
-        subnet=state["subnet"],
-    ))
+    )
     _run(["ip", "netns", "del", state["netns_name"]], check=False)
 
     import shutil
